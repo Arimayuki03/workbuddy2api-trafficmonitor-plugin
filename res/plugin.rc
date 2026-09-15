@@ -1,0 +1,17 @@
+// plugin.rc — 设置对话框框架（页内控件全部代码创建）。
+// rc.exe 以 UTF-8 读中文文本必须带这行 code_page 编译指示。
+#pragma code_page(65001)
+#include "resource.h"
+#include <windows.h>
+
+/////////////////////////////////////////////////////////////////////////////
+// 对话框：仅 Tab + 保存/关闭；标签页内容由 DlgProc 动态生成
+IDD_SETTINGS DIALOGEX 0, 0, 442, 302
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "WorkBuddy2API 插件设置"
+FONT 9, "Microsoft YaHei UI", 400, 0, 1
+BEGIN
+    CONTROL "", IDC_TAB, "SysTabControl32", TCS_TABS | WS_CHILD | WS_VISIBLE | WS_TABSTOP, 7, 7, 428, 262
+    DEFPUSHBUTTON "保存(&S)", IDOK, 275, 280, 70, 16
+    PUSHBUTTON "关闭", IDCANCEL, 351, 280, 70, 16
+END

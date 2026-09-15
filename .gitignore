@@ -1,0 +1,21 @@
+# 构建产物
+build/out/
+build/obj/
+*.obj
+*.dll
+*.exe
+*.ilk
+*.pdb
+*.res
+*.exp
+*.lib
+.vs/
+*.user
+# 工具/会话缓存
+.v2c/
+.zcode/
+# 运行期临时
+wb2_*.log
+shot_cfg/
+dlg_cfg/
+test_cfg/

@@ -17,12 +17,12 @@ enum ShowMode {
 struct Settings {
     std::wstring service_dir = L"D:\\Code\\workbuddy2api"; // wb2api 安装目录（工作目录+exe+config.json）
     int port = 7863;
-    std::wstring api_key_manual;              // 空 = 自动读 service_dir\config.json 的 api_key
     int poll_interval_sec = 30;               // /healthz+/status 轮询（零上游成本，>=10）
     int admin_poll_sec = 60;                  // /admin/tasks、/admin/credits 轮询（服务端本地缓存）
-    int credits_refresh_interval_min = 0;     // 实时积分自动刷新周期（分钟）；0=仅手动，>=10
+    int credits_refresh_interval_min = 0;     // 实时积分自动刷新周期（分钟）；0=仅手动，>=1
     int show_mode = SM_STATE_ACCOUNT;
     bool show_live_credits = true;            // 显示积分时优先用实时缓存
+    bool tooltip_full = true;                 // tooltip 完整展开；关闭=折叠为 4 行/~150 字符（多插件同载防宿主 1024 超限弹框）
     bool autostart_task = false;              // Windows 计划任务随登录启动服务
     bool start_with_tm = false;               // TrafficMonitor 启动时拉起服务
     bool auto_relaunch = false;               // 意外停止自动拉起
@@ -41,7 +41,7 @@ public:
     // 保存：锁内替换 + 锁外原子落盘（tmp+rename）。
     void Update(const Settings& s);
 
-    // api_key：manual 非空则用之；否则读 service_dir\config.json（mtime 缓存，静默失败返回空）。
+    // api_key：读 service_dir\config.json 的 api_key（mtime 缓存，静默失败返回空）。
     // 可能从 worker/action/UI 线程调用，内部自锁。返回 UTF-8。
     std::string CurrentApiKey();
 

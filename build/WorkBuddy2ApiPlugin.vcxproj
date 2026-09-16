@@ -46,6 +46,7 @@
       <RuntimeLibrary>MultiThreaded$(_MTdSuffix)</RuntimeLibrary>
       <ExceptionHandling>SyncCThrow</ExceptionHandling>
       <TreatWarningAsError>false</TreatWarningAsError>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -98,6 +99,7 @@
     <ClCompile Include="..\src\item.cpp" />
     <ClCompile Include="..\src\plugin.cpp" />
     <ClCompile Include="..\src\dialogs.cpp" />
+    <ClCompile Include="..\src\trace.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\res\plugin.rc" />

@@ -14,6 +14,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace wb2 {
 
@@ -36,6 +37,7 @@ public:
     bool RequestRestartService();
     bool RequestRunTask(const std::string& kind);            // kind 或 "all"
     bool RequestToggleTask(const std::string& kind, bool enabled);
+    bool RequestSetTaskHours(const std::string& kind, const std::vector<int>& hours); // 写回服务 config.json（重启生效）
     bool RequestRefreshCredits();
     bool IsActionBusy(const std::string& key) const;         // "svc"/"credits"/"task:<kind>"
 

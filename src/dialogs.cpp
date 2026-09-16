@@ -2,7 +2,12 @@
 //  * 打开时拷贝一份 Settings 作为"编辑中"副本，点"保存"才落盘并 diff 应用副作用（计划任务等）；
 //  * 实时信息（状态/账户/任务/冷却）每秒从 Worker 快照刷新，只改展示控件，不碰输入框；
 //  * 任务勾选 = 即时动作（PATCH），不等"保存"——它管理的是服务本体，不是插件配置；
-//  * 按钮 busy 态由 Worker::IsActionBusy 驱动防连点；实时积分还有服务端 429 第二道闸。
+//  * 按钮 busy 态由 Worker::IsActionBusy 驱动防连点；实时积分还有服务端 429 第二道闸；
+//  * 只认 BN_CLICKED（按钮不带 BS_NOTIFY）：焦点类通知曾让"打开目录/日志"在 explorer
+//    抢/还焦点时连环触发，表现为重复开资源管理器、关掉又自动重开；
+//  * 背景统一：初始化时采样 tab 页体的实际绘制颜色做刷子（aero 浅色主题页体是
+//    F9F9F9 浅灰——既不是 COLOR_WINDOW 白也不是 COLOR_BTNFACE 灰，用错哪个，
+//    标签后面都是一条异色带，视觉上像"阴影"），对话框与静态控件同色消除底条。
 #include "dialogs.h"
 #include "autostart.h"
 #include "common.h"
@@ -17,10 +22,13 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shlwapi.h>
+#include <uxtheme.h>
 #include <ctime>
+#include <algorithm>
 #include <vector>
 
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "shlwapi.lib")
 
@@ -42,16 +50,20 @@ int64_t NowSecX() { return static_cast<int64_t>(time(nullptr)); }
 bool SettingsEqual(const Settings& a, const Settings& b)
 {
     return a.service_dir == b.service_dir && a.port == b.port &&
-        a.api_key_manual == b.api_key_manual && a.poll_interval_sec == b.poll_interval_sec &&
+        a.poll_interval_sec == b.poll_interval_sec &&
         a.admin_poll_sec == b.admin_poll_sec &&
         a.credits_refresh_interval_min == b.credits_refresh_interval_min &&
         a.show_mode == b.show_mode && a.show_live_credits == b.show_live_credits &&
+        a.tooltip_full == b.tooltip_full &&
         a.autostart_task == b.autostart_task && a.start_with_tm == b.start_with_tm &&
         a.auto_relaunch == b.auto_relaunch && a.logging == b.logging;
 }
 
 struct TaskRow {
-    HWND chk = nullptr, hours = nullptr, next = nullptr, status = nullptr, btn = nullptr;
+    // time=触发时间输入框（"9,21"），apply=应用按钮（写回服务 config.json）。
+    // 与运行列按钮共用 IDC_TASK_BASE 槽位：i*10+0 勾选 / +5 立即执行 / +6 输入框 / +7 应用。
+    HWND chk = nullptr, time = nullptr, next = nullptr, status = nullptr, btn = nullptr, apply = nullptr;
+    std::wstring synced; // 上次已回填进 time 框的快照值（防止每秒刷新覆盖用户编辑中内容）
 };
 
 struct Ctx {
@@ -61,9 +73,10 @@ struct Ctx {
     std::vector<HWND> pages[5];
     int cur_page = 0;
     HFONT font = nullptr;
+    HBRUSH bg_brush = nullptr; // 页体色刷：对话框背景与静态控件共用，消"灰底条阴影"
     // 页①
     HWND state_lbl = nullptr, sub_lbl = nullptr, err_lbl = nullptr, action_lbl = nullptr;
-    HWND dir_edt = nullptr, port_edt = nullptr, key_edt = nullptr, poll_edt = nullptr;
+    HWND dir_edt = nullptr, port_edt = nullptr, poll_edt = nullptr;
     HWND btn_start = nullptr, btn_stop = nullptr, btn_restart = nullptr;
     HWND chk_auto = nullptr, chk_tm = nullptr, chk_relaunch = nullptr, chk_log = nullptr;
     COLORREF state_color = RGB(120, 120, 120);
@@ -74,9 +87,11 @@ struct Ctx {
     TaskRow task[KIND_N];
     HWND task_warn = nullptr, btn_runall = nullptr, task_note = nullptr;
     // 页④
-    HWND rad[3] = {}, chk_live = nullptr;
+    HWND rad[3] = {}, chk_live = nullptr, chk_tipfull = nullptr;
     // 页⑤
     HWND admin_edt = nullptr, admin_stat = nullptr;
+    // 次要说明文字集合：CTLCOLORSTATIC 里统一画灰
+    std::vector<HWND> hints;
 };
 
 // 子控件统一按"tab 显示区左上角 + DLU 坐标"创建；id/page 归属见 resource.h。
@@ -102,18 +117,63 @@ HWND MkLabel(Ctx& c, LPCWSTR t, int l, int tp, int w, int h, int page, DWORD ext
 {
     return MkWnd(c, L"STATIC", t, SS_LEFT | SS_NOPREFIX | extra, 0, l, tp, w, h, 0, page);
 }
+// 次要说明文字：WM_CTLCOLORSTATIC 里统一画成灰色，与正文形成层级。
+HWND MkHint(Ctx& c, LPCWSTR t, int l, int tp, int w, int h, int page)
+{
+    HWND hw = MkLabel(c, t, l, tp, w, h, page);
+    c.hints.push_back(hw);
+    return hw;
+}
+// 一律不带 BS_NOTIFY：它会启用 BN_SETFOCUS/BN_KILLFOCUS 通知，explorer 抢/还焦点时
+// 这些通知也走 WM_COMMAND，曾被当成点击处理——表现为"打开目录/日志"一次点出多个
+// 资源管理器、关掉窗口焦点回到按钮又自动重开。动作只认 BN_CLICKED（见 WM_COMMAND 门禁）。
 HWND MkCheck(Ctx& c, LPCWSTR t, int l, int tp, int w, int id, int page)
 {
-    return MkWnd(c, L"BUTTON", t, BS_AUTOCHECKBOX | BS_NOTIFY | WS_TABSTOP, 0, l, tp, w, 10, id, page);
+    return MkWnd(c, L"BUTTON", t, BS_AUTOCHECKBOX | WS_TABSTOP, 0, l, tp, w, 10, id, page);
 }
 HWND MkBtn(Ctx& c, LPCWSTR t, int l, int tp, int w, int h, int id, int page)
 {
-    return MkWnd(c, L"BUTTON", t, BS_PUSHBUTTON | BS_NOTIFY | WS_TABSTOP, 0, l, tp, w, h, id, page);
+    return MkWnd(c, L"BUTTON", t, BS_PUSHBUTTON | WS_TABSTOP, 0, l, tp, w, h, id, page);
 }
 HWND MkEdit(Ctx& c, LPCWSTR t, int l, int tp, int w, int id, int page, DWORD extra = 0)
 {
+    // 平边框（WS_BORDER，去掉 CLIENTEDGE 凹陷框）：与纯色页体更协调。
     return MkWnd(c, L"EDIT", t, WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | extra,
-        WS_EX_CLIENTEDGE, l, tp, w, 12, id, page);
+        0, l, tp, w, 12, id, page);
+}
+
+#ifndef HDM_GETITEMRECT
+#define HDM_GETITEMRECT (HDM_FIRST + 7)
+#endif
+// 账户表子类化：主题 ListView 的网格线(240,240,240 浅灰)在默认 WM_PAINT 里最后画，
+// NM_CUSTOMDRAW 阶段的补画会被盖掉。只能在默认绘制完成后追加表头切割线——
+// 表头下沿那条与数据行分隔的横线在浅色主题里太淡（贴着表头渐变底），要加深一档。
+LRESULT CALLBACK AccListProc(HWND h, UINT msg, WPARAM wp, LPARAM lp,
+    UINT_PTR id, DWORD_PTR ref)
+{
+    LRESULT r = DefSubclassProc(h, msg, wp, lp);
+    if (msg == WM_PAINT) {
+        // 表头高度：表头客户区与列表客户区同原点(顶部满宽)，item0 的 bottom 即高度。
+        // 不用 HDM_GETITEMHEIGHT——老 SDK 头里没有这个常量，手猜值翻过车。
+        RECT hrc{};
+        HWND hdr = ListView_GetHeader(h);
+        // 表头高度取 item0 的 rect.bottom（客户区同原点）。不用 HDM_GETITEMHEIGHT——
+        // 老头文件里没有这个常量，手猜消息值翻过车（返回 0，线画到顶边框上）。
+        if (hdr && SendMessageW(hdr, HDM_GETITEMRECT, 0, reinterpret_cast<LPARAM>(&hrc))) {
+            HDC dc = GetDC(h);
+            if (dc) {
+                RECT rc{};
+                GetClientRect(h, &rc);
+                RECT line{ 0, static_cast<int>(hrc.bottom), rc.right, static_cast<int>(hrc.bottom) + 1 };
+                // 100,100,100 ≈ 控件主题边框色，比网格线深两档、比纯黑柔
+                HBRUSH br = CreateSolidBrush(RGB(100, 100, 100));
+                FillRect(dc, &line, br);
+                DeleteObject(br);
+                ReleaseDC(h, dc);
+            }
+        }
+    }
+    return r;
 }
 
 std::wstring GetText(HWND h)
@@ -138,6 +198,7 @@ void ShowPage(Ctx& c, int idx)
     c.cur_page = idx;
 }
 
+// 触发时间编辑框内容："9,21"（纯小时列表，逗号分隔）；无数据 "-"。
 std::wstring HoursText(const TaskInfo& t)
 {
     std::wstring s;
@@ -145,7 +206,7 @@ std::wstring HoursText(const TaskInfo& t)
         if (!s.empty()) s += L",";
         s += std::to_wstring(hv);
     }
-    return s.empty() ? L"-" : s + L" 点";
+    return s.empty() ? L"-" : s;
 }
 
 void FillAccountList(Ctx& c, const Snapshot& sn)
@@ -163,9 +224,17 @@ void FillAccountList(Ctx& c, const Snapshot& sn)
         };
         setcol(1, a.realm.empty() ? L"cn" : a.realm);
         setcol(2, FormatThousands(a.credits));
+        // 实时列："剩余（已用/总量）"——used/size 来自 /admin/credits，查询失败/未查时只有 "-"
         std::wstring livev = L"-";
         for (auto& r : sn.credits.rows) {
-            if (r.uid8 == a.uid8) { livev = r.ok ? FormatThousands(r.remain) : L"失败"; break; }
+            if (r.uid8 == a.uid8) {
+                if (!r.ok) livev = L"失败";
+                else if (r.used >= 0 && r.size >= 0)
+                    livev = WideFormat(L"%s（%s/%s）", FormatThousands(r.remain).c_str(),
+                        FormatThousands(r.used).c_str(), FormatThousands(r.size).c_str());
+                else livev = FormatThousands(r.remain);
+                break;
+            }
         }
         setcol(3, livev);
         std::wstring st;
@@ -222,8 +291,9 @@ void Refresh(Ctx& c)
         cool = WideFormat(L"服务端限频：还差 %lld 秒（上次查询 %s）",
             sn.credits.cooldown_until - NowSecX(), FormatTimeShort(sn.credits.ts).c_str());
     else if (sn.credits.have)
-        cool = WideFormat(L"上次 %s · 总剩 %s · 现在可查",
-            FormatTimeShort(sn.credits.ts).c_str(), FormatThousands(sn.credits.total_remain).c_str());
+        cool = WideFormat(L"上次 %s · 总剩 %s · 已用 %s · 现在可查",
+            FormatTimeShort(sn.credits.ts).c_str(), FormatThousands(sn.credits.total_remain).c_str(),
+            sn.credits.total_used >= 0 ? FormatThousands(sn.credits.total_used).c_str() : L"-");
     else cool = L"尚未查询 · 按钮会逐号向服务端发起实时余额查询";
     SetWindowTextW(c.lbl_cool, cool.c_str());
     int64_t sig = sn.last_ok_ts * 131 + sn.credits.ts * 7 + static_cast<int64_t>(sn.accounts.size());
@@ -244,23 +314,29 @@ void Refresh(Ctx& c)
         bool busy = Worker::Instance().IsActionBusy(std::string("task:") + kKinds[i]);
         if (t) {
             SendMessageW(c.task[i].chk, BM_SETCHECK, t->enabled ? BST_CHECKED : BST_UNCHECKED, 0);
-            SetWindowTextW(c.task[i].hours, HoursText(*t).c_str());
             std::wstring nxt = t->enabled
                 ? (t->next_fire.empty() ? std::wstring(L"-") : t->next_fire)
                 : std::wstring(L"停用");
             SetWindowTextW(c.task[i].next, nxt.c_str());
             std::wstring status;
             if (t->running) status = L"执行中…";
-            else if (t->last_run) status = L"上次 " + FormatTimeShort(t->last_run) + L" " + t->last_result;
+            else if (t->last_run) status = FormatTimeShort(t->last_run) + L" " + t->last_result;
             else status = L"本进程未执行过";
             SetWindowTextW(c.task[i].status, status.c_str());
+            // 触发时间输入框：非焦点时回填服务端快照（焦点=用户可能正在编辑，跳过）。
+            std::wstring want = HoursText(*t);
+            if (GetFocus() != c.task[i].time && c.task[i].synced != want) {
+                SetWindowTextW(c.task[i].time, want.c_str());
+                c.task[i].synced = want;
+            }
         } else {
-            SetWindowTextW(c.task[i].hours, L"-");
             SetWindowTextW(c.task[i].next, L"-");
             SetWindowTextW(c.task[i].status, L"-");
         }
         EnableWindow(c.task[i].chk, sn.admin_available && t && !busy);
         EnableWindow(c.task[i].btn, sn.admin_available && t && !busy && on);
+        EnableWindow(c.task[i].apply,
+            sn.admin_available && t && !Worker::Instance().IsActionBusy(std::string("taskhours:") + kKinds[i]));
     }
     EnableWindow(c.btn_runall, sn.admin_available && on && !Worker::Instance().IsActionBusy("task:all"));
     SetWindowTextW(c.task_note, sn.tasks_ts
@@ -285,6 +361,33 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         cp->dlg = hDlg;
         cp->font = reinterpret_cast<HFONT>(SendMessageW(hDlg, WM_GETFONT, 0, 0));
         cp->tab = GetDlgItem(hDlg, IDC_TAB);
+        // 页体对齐色：tab 页体在 aero 主题下是 F9F9F9 浅灰，但不同主题/系统会变
+        // （COLOR_WINDOW 白、COLOR_BTNFACE 灰、深色主题更暗）。不猜系统色——
+        // 让 tab 控件在 WM_PRINTCLIENT 里把自己画进内存位图，采样 tab 显示区
+        // 中心一点的像素作为页体真实色。采样失败则回退 COLOR_WINDOW。
+        {
+            RECT rc{};
+            TabCtrl_GetItemRect(cp->tab, 0, &rc); // 仅确认 tab 有尺寸，取显示区用 AdjustRect
+            RECT disp{ 0, 0, 200, 60 };
+            TabCtrl_AdjustRect(cp->tab, FALSE, &disp);
+            COLORREF body = CLR_NONE;
+            int cx = (disp.left + disp.right) / 2, cy = (disp.top + disp.bottom) / 2;
+            if (HDC wdc = GetWindowDC(cp->tab)) {
+                HDC mdc = CreateCompatibleDC(wdc);
+                HBITMAP bmp = CreateCompatibleBitmap(wdc, disp.right - disp.left + 40, disp.bottom - disp.top + 40);
+                HBITMAP old = reinterpret_cast<HBITMAP>(SelectObject(mdc, bmp));
+                SetWindowOrgEx(mdc, disp.left - 20, disp.top - 20, nullptr);
+                SendMessageW(cp->tab, WM_PRINTCLIENT, reinterpret_cast<WPARAM>(mdc), PRF_CLIENT);
+                body = GetPixel(mdc, cx, cy);
+                SelectObject(mdc, old);
+                DeleteObject(bmp);
+                DeleteDC(mdc);
+                ReleaseDC(cp->tab, wdc);
+                // 全黑多半是位图没画上（个别主题包装器不支持 WM_PRINTCLIENT），回退
+                if (body == RGB(0, 0, 0)) body = CLR_NONE;
+            }
+            cp->bg_brush = CreateSolidBrush(body != CLR_NONE ? body : GetSysColor(COLOR_WINDOW));
+        }
         struct { LPCWSTR t; } tabs[] = { { L"服务" }, { L"账户与积分" }, { L"定时任务" }, { L"显示" }, { L"高级" } };
         for (int i = 0; i < 5; i++) {
             TCITEMW ti{};
@@ -294,38 +397,44 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         }
 
         // —— 页① 服务 ——
-        cp->state_lbl = MkLabel(*cp, L"状态：未知", 8, 8, 404, 10, 0);
-        cp->sub_lbl = MkLabel(*cp, L"", 8, 22, 404, 10, 0);
-        MkLabel(*cp, L"服务目录:", 8, 44, 42, 10, 0);
-        cp->dir_edt = MkEdit(*cp, cp->work.service_dir.c_str(), 52, 42, 300, IDC_EDT_DIR, 0);
-        MkBtn(*cp, L"浏览…", 356, 42, 46, 14, IDC_BTN_BROWSE, 0);
-        MkLabel(*cp, L"端口:", 8, 64, 42, 10, 0);
-        cp->port_edt = MkEdit(*cp, std::to_wstring(cp->work.port).c_str(), 52, 62, 40, IDC_EDT_PORT, 0, ES_NUMBER);
-        MkLabel(*cp, L"API Key:", 98, 64, 40, 10, 0);
-        cp->key_edt = MkEdit(*cp, cp->work.api_key_manual.c_str(), 140, 62, 160, IDC_EDT_KEY, 0);
-        MkLabel(*cp, L"轮询秒:", 306, 64, 40, 10, 0);
-        cp->poll_edt = MkEdit(*cp, std::to_wstring(cp->work.poll_interval_sec).c_str(), 346, 62, 30, IDC_EDT_POLL, 0, ES_NUMBER);
-        MkLabel(*cp, L"Key 留空 = 自动读服务目录 config.json；手填则覆盖。轮询 ≥10 秒（/status 免费，无风控压力）。", 8, 78, 404, 10, 0);
-        cp->btn_start = MkBtn(*cp, L"启动服务", 8, 94, 60, 14, IDC_BTN_START, 0);
-        cp->btn_stop = MkBtn(*cp, L"停止服务", 74, 94, 60, 14, IDC_BTN_STOP, 0);
-        cp->btn_restart = MkBtn(*cp, L"重启服务", 140, 94, 60, 14, IDC_BTN_RESTART, 0);
-        cp->chk_auto = MkCheck(*cp, L"开机自动启动（计划任务，登录+10秒延迟）", 8, 116, 250, IDC_CHK_AUTOSTART, 0);
-        cp->chk_tm = MkCheck(*cp, L"随 TrafficMonitor 启动时拉起", 8, 130, 200, IDC_CHK_TM, 0);
-        cp->chk_relaunch = MkCheck(*cp, L"意外停止自动拉起（10 分钟最多 3 次）", 8, 144, 250, IDC_CHK_RELAUNCH, 0);
-        cp->chk_log = MkCheck(*cp, L"调试日志（写插件配置目录）", 8, 158, 200, IDC_CHK_LOG, 0);
+        // 布局：状态区 → 服务目录行 → 端口/轮询行 → 按钮行 → 自启动选项 → 提示区。
+        // 标签右对齐到 x=50，输入框统一从 x=54 起（DLU），行距 20。
+        cp->state_lbl = MkLabel(*cp, L"状态：未知", 8, 6, 404, 10, 0);
+        cp->sub_lbl = MkLabel(*cp, L"", 8, 20, 404, 10, 0);
+        MkLabel(*cp, L"服务目录:", 8, 42, 42, 10, 0);
+        cp->dir_edt = MkEdit(*cp, cp->work.service_dir.c_str(), 54, 40, 280, IDC_EDT_DIR, 0);
+        MkBtn(*cp, L"浏览…", 338, 40, 46, 14, IDC_BTN_BROWSE, 0);
+        MkLabel(*cp, L"端口:", 8, 62, 42, 10, 0);
+        cp->port_edt = MkEdit(*cp, std::to_wstring(cp->work.port).c_str(), 54, 60, 40, IDC_EDT_PORT, 0, ES_NUMBER);
+        MkLabel(*cp, L"轮询秒:", 100, 62, 40, 10, 0);
+        cp->poll_edt = MkEdit(*cp, std::to_wstring(cp->work.poll_interval_sec).c_str(), 142, 60, 40, IDC_EDT_POLL, 0, ES_NUMBER);
+        MkHint(*cp, L"鉴权自动读服务目录 config.json 的 api_key，无需在此填写。轮询 ≥10 秒（/status 免费，无风控压力）。",
+            8, 76, 404, 10, 0);
+        cp->btn_start = MkBtn(*cp, L"启动服务", 8, 92, 60, 14, IDC_BTN_START, 0);
+        cp->btn_stop = MkBtn(*cp, L"停止服务", 74, 92, 60, 14, IDC_BTN_STOP, 0);
+        cp->btn_restart = MkBtn(*cp, L"重启服务", 140, 92, 60, 14, IDC_BTN_RESTART, 0);
+        cp->chk_auto = MkCheck(*cp, L"开机自动启动（计划任务，登录+10秒延迟）", 8, 114, 250, IDC_CHK_AUTOSTART, 0);
+        cp->chk_tm = MkCheck(*cp, L"随 TrafficMonitor 启动时拉起", 8, 128, 200, IDC_CHK_TM, 0);
+        cp->chk_relaunch = MkCheck(*cp, L"意外停止自动拉起（10 分钟最多 3 次）", 8, 142, 250, IDC_CHK_RELAUNCH, 0);
+        cp->chk_log = MkCheck(*cp, L"调试日志（写插件配置目录）", 8, 156, 200, IDC_CHK_LOG, 0);
         SendMessageW(cp->chk_auto, BM_SETCHECK, cp->work.autostart_task ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(cp->chk_tm, BM_SETCHECK, cp->work.start_with_tm ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(cp->chk_relaunch, BM_SETCHECK, cp->work.auto_relaunch ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(cp->chk_log, BM_SETCHECK, cp->work.logging ? BST_CHECKED : BST_UNCHECKED, 0);
-        cp->err_lbl = MkLabel(*cp, L" ", 8, 176, 404, 10, 0);
-        cp->action_lbl = MkLabel(*cp, L" ", 8, 190, 404, 10, 0);
+        cp->err_lbl = MkLabel(*cp, L" ", 8, 174, 404, 10, 0);
+        cp->action_lbl = MkLabel(*cp, L" ", 8, 188, 404, 10, 0);
 
         // —— 页② 账户与积分 ——
+        // 实时列含"剩余（已用/总量）"，需要更宽：列宽 66+54+46+180+62+50=458，列表框 462。
         cp->acc_list = MkWnd(*cp, WC_LISTVIEWW, L"",
-            LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER, 0, 8, 8, 400, 140, IDC_LST_ACC, 1);
+            LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER, 0, 8, 8, 462, 140, IDC_LST_ACC, 1);
         ListView_SetExtendedListViewStyle(cp->acc_list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+        // 默认 aero 主题下 LVS_EX_GRIDLINES 的竖线与表头分隔线错位数像素、表头下沿缺一条
+        // 横线（经典毛病）。切 Explorer 主题后表头与网格线走同一套绘制，行列线对齐。
+        SetWindowTheme(cp->acc_list, L"Explorer", nullptr);
+        SetWindowSubclass(cp->acc_list, AccListProc, 1, 0);
         struct Col { LPCWSTR t; int w; };
-        const Col cols[] = { { L"昵称", 88 }, { L"域", 34 }, { L"估算", 58 }, { L"实时", 62 }, { L"状态", 116 }, { L"令牌剩", 56 } };
+        const Col cols[] = { { L"昵称", 88 }, { L"域", 34 }, { L"估算", 58 }, { L"实时(已用/总量)", 150 }, { L"状态", 76 }, { L"令牌剩", 50 } };
         for (int i = 0; i < 6; i++) {
             LVCOLUMNW cv{};
             cv.mask = LVCF_TEXT | LVCF_WIDTH;
@@ -334,50 +443,73 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             ListView_InsertColumn(cp->acc_list, i, &cv);
         }
         cp->btn_cred = MkBtn(*cp, L"查询实时积分", 8, 156, 80, 14, IDC_BTN_CRED, 1);
-        cp->lbl_cool = MkLabel(*cp, L"", 94, 158, 320, 10, 1);
-        MkLabel(*cp, L"自动刷新周期(分钟,0=关,≥10):", 8, 178, 150, 10, 1);
+        cp->lbl_cool = MkLabel(*cp, L"", 94, 158, 370, 10, 1);
+        MkLabel(*cp, L"自动刷新周期(分钟,0=关,≥1):", 8, 178, 150, 10, 1);
         cp->citv_edt = MkEdit(*cp, std::to_wstring(cp->work.credits_refresh_interval_min).c_str(), 160, 176, 34, IDC_EDT_CINTERVAL, 1, ES_NUMBER);
-        MkLabel(*cp, L"估算=本地账本，插件轮询零成本；实时=服务端逐号查上游余额（默认限频 10 分钟）。自动刷新默认关闭，开也要 ≥10 分钟，防风控。", 8, 194, 404, 20, 1);
+        MkHint(*cp, L"估算=本地账本，插件轮询零成本；实时=服务端逐号查上游余额并回写账本，括号内为该号已用/原始总量。",
+            8, 194, 404, 10, 1);
+        MkHint(*cp, L"自动刷新默认关闭，开也要 ≥1 分钟（服务端还有默认 10 分钟冷却做第二道闸，太密会被 429 挡回）。",
+            8, 206, 404, 10, 1);
 
         // —— 页③ 定时任务 ——
+        // 表头一行 + 每任务一行：勾选 | 触发时间(可编辑) | 下次 | 上次/状态 | 立即执行 | 应用。
+        // 状态列加宽到 172 并把"应用"压到 x=414：旧布局 150 宽度装不下长结果
+        // （"ok=0 already=4 fail=0 skipped=0"约 40 字符）被截换行，视觉上像被下一行遮挡。
+        // 页面可用宽度 ≈472 DLU（对话框 500 减边框/tab 边距），列宽合计 8+70+44+8+40+8+172+8+44+8+40 ≈ 458。
+        const struct { LPCWSTR t; int x; int w; } hdr[] = {
+            { L"任务", 10, 64 }, { L"触发时间(点)", 82, 46 }, { L"下次", 150, 40 },
+            { L"状态(上次结果)", 194, 176 }, { L"", 374, 44 }, { L"", 420, 40 },
+        };
+        for (int k = 0; k < 6; k++) MkLabel(*cp, hdr[k].t, hdr[k].x, 24, hdr[k].w, 10, 2);
         cp->task_warn = MkLabel(*cp, L" ", 8, 8, 404, 10, 2);
         for (int i = 0; i < KIND_N; i++) {
-            int y = 26 + i * 26;
+            int y = 42 + i * 26;
             cp->task[i].chk = MkCheck(*cp, kKindZh[i], 8, y, 70, IDC_TASK_BASE + i * 10, 2);
-            cp->task[i].hours = MkLabel(*cp, L"-", 82, y, 66, 10, 2);
-            cp->task[i].next = MkLabel(*cp, L"-", 150, y, 44, 10, 2);
-            cp->task[i].status = MkLabel(*cp, L"-", 196, y, 150, 10, 2);
-            cp->task[i].btn = MkBtn(*cp, L"立即执行", 348, y - 2, 58, 14, IDC_TASK_BASE + i * 10 + 5, 2);
+            // 时间输入框不用 ES_NUMBER：内容是"9,21"逗号分隔小时列表
+            cp->task[i].time = MkEdit(*cp, L"-", 82, y - 2, 44, IDC_TASK_BASE + i * 10 + 6, 2);
+            cp->task[i].next = MkLabel(*cp, L"-", 150, y, 40, 10, 2);
+            cp->task[i].status = MkLabel(*cp, L"-", 194, y, 176, 10, 2);
+            cp->task[i].btn = MkBtn(*cp, L"立即执行", 374, y - 2, 44, 14, IDC_TASK_BASE + i * 10 + 5, 2);
+            cp->task[i].apply = MkBtn(*cp, L"应用", 420, y - 2, 40, 14, IDC_TASK_BASE + i * 10 + 7, 2);
         }
-        cp->btn_runall = MkBtn(*cp, L"全部执行", 8, 188, 60, 14, IDC_BTN_RUNALL, 2);
-        cp->task_note = MkLabel(*cp, L"", 76, 190, 340, 10, 2);
-        MkLabel(*cp, L"立即执行在服务进程内跑（与定时任务同一把锁，不会再有 task.exe 抢写状态文件的竞争）。", 8, 206, 404, 10, 2);
+        cp->btn_runall = MkBtn(*cp, L"全部执行", 8, 202, 60, 14, IDC_BTN_RUNALL, 2);
+        cp->task_note = MkLabel(*cp, L"", 76, 204, 390, 10, 2);
+        MkHint(*cp, L"触发时间=24 小时制小时列表（逗号分隔，如 9,21）；「应用」写回服务 config.json，重启服务后生效。",
+            8, 220, 404, 10, 2);
+        MkHint(*cp, L"立即执行在服务进程内跑（与定时任务同一把锁）；状态列显示上次执行结果与耗时。", 8, 232, 404, 10, 2);
 
         // —— 页④ 显示 ——
         cp->rad[0] = MkWnd(*cp, L"BUTTON", L"状态 + 账号数（如 4/4）", BS_AUTORADIOBUTTON | WS_TABSTOP, 0, 8, 8, 220, 10, IDC_RAD_ACCOUNT, 3);
         cp->rad[1] = MkWnd(*cp, L"BUTTON", L"状态 + 积分（如 5.6k）", BS_AUTORADIOBUTTON | WS_TABSTOP, 0, 8, 24, 220, 10, IDC_RAD_CREDITS, 3);
         cp->rad[2] = MkWnd(*cp, L"BUTTON", L"仅状态词（运行/停止）", BS_AUTORADIOBUTTON | WS_TABSTOP, 0, 8, 40, 220, 10, IDC_RAD_ONLY, 3);
         cp->chk_live = MkCheck(*cp, L"积分优先显示实时值（有缓存时）", 8, 58, 240, IDC_CHK_LIVECRD, 3);
-        MkLabel(*cp, L"状态点颜色：绿=运行且可用 · 橙=在跑无可用账号 · 灰=已停止 · 红=端口被占/无响应", 8, 76, 404, 10, 3);
-        MkLabel(*cp, L"任务栏宽度按最长样例预留；单击任务栏上的本栏位即可打开此设置窗。", 8, 90, 404, 10, 3);
+        cp->chk_tipfull = MkCheck(*cp, L"悬浮提示完整展开（多插件同载弹参数错误时关闭此项）", 8, 74, 340, IDC_CHK_TIPFULL, 3);
+        // MkWnd 给所有控件都加了 WS_GROUP，会让每个单选各自成组、点不互相取消；
+        // 清掉后两个的 WS_GROUP，让三个 radio（Z 序相邻）构成同一个互斥组；
+        // 再清 WS_TABSTOP（标准组语义：仅组首有 Tab 停靠，组内靠方向键移动）。
+        for (int i = 1; i < 3; i++)
+            SetWindowLongW(cp->rad[i], GWL_STYLE, GetWindowLongW(cp->rad[i], GWL_STYLE) & ~(WS_GROUP | WS_TABSTOP));
+        MkHint(*cp, L"状态点颜色：绿=运行且可用 · 橙=在跑无可用账号 · 灰=已停止 · 红=端口被占/无响应", 8, 92, 404, 10, 3);
+        MkHint(*cp, L"任务栏宽度按最长样例预留；单击任务栏上的本栏位即可打开此设置窗。", 8, 106, 404, 10, 3);
         if (cp->work.show_mode >= 0 && cp->work.show_mode <= 2)
             SendMessageW(cp->rad[cp->work.show_mode], BM_SETCHECK, BST_CHECKED, 0);
         else
             SendMessageW(cp->rad[0], BM_SETCHECK, BST_CHECKED, 0);
         SendMessageW(cp->chk_live, BM_SETCHECK, cp->work.show_live_credits ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessageW(cp->chk_tipfull, BM_SETCHECK, cp->work.tooltip_full ? BST_CHECKED : BST_UNCHECKED, 0);
 
         // —— 页⑤ 高级 ——
         MkLabel(*cp, L"管理接口轮询(秒,≥15):", 8, 10, 100, 10, 4);
         cp->admin_edt = MkEdit(*cp, std::to_wstring(cp->work.admin_poll_sec).c_str(), 110, 8, 34, IDC_EDT_ADMIN, 4, ES_NUMBER);
-        cp->admin_stat = MkLabel(*cp, L"", 8, 28, 400, 10, 4);
+        cp->admin_stat = MkLabel(*cp, L"", 8, 28, 460, 10, 4);
         MkBtn(*cp, L"打开插件配置目录", 8, 46, 100, 14, IDC_BTN_OPENCFG, 4);
         MkBtn(*cp, L"打开服务目录", 112, 46, 80, 14, IDC_BTN_OPENSVC, 4);
         MkBtn(*cp, L"打开服务日志", 196, 46, 80, 14, IDC_BTN_OPENLOG, 4);
         MkBtn(*cp, L"打开插件日志", 280, 46, 80, 14, IDC_BTN_OPENPLOG, 4);
-        MkLabel(*cp, L"WorkBuddy2API TrafficMonitor 插件 v1.0.0 · MIT", 8, 70, 404, 10, 4);
-        MkLabel(*cp, L"https://github.com/Arimayuki03/workbuddy2api-trafficmonitor-plugin", 8, 84, 404, 10, 4);
-        MkLabel(*cp, L"设计约束：/healthz /status /admin 均为本机回环接口；本插件永不调用 /v1/chat/completions，", 8, 104, 404, 10, 4);
-        MkLabel(*cp, L"与你的 API 使用互不影响。实时积分查询由服务端冷却与单飞兜底，防止任何路径触发上游风控。", 8, 118, 404, 10, 4);
+        MkLabel(*cp, L"WorkBuddy2API TrafficMonitor 插件 v1.1.0 · MIT", 8, 70, 404, 10, 4);
+        MkHint(*cp, L"https://github.com/Arimayuki03/workbuddy2api-trafficmonitor-plugin", 8, 84, 404, 10, 4);
+        MkHint(*cp, L"设计约束：/healthz /status /admin 均为本机回环接口；本插件永不调用 /v1/chat/completions，", 8, 104, 460, 10, 4);
+        MkHint(*cp, L"与你的 API 使用互不影响。实时积分查询由服务端冷却与单飞兜底，防止任何路径触发上游风控。", 8, 118, 460, 10, 4);
 
         ShowPage(*cp, 0);
         SetTimer(hDlg, 7, 1000, nullptr);
@@ -400,11 +532,15 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         if (!cp) return FALSE;
         int id = LOWORD(wp), code = HIWORD(wp);
         Ctx& c = *cp;
+        // 门禁：只放行 BN_CLICKED。BS_NOTIFY 焦点类通知（BN_SETFOCUS/BN_KILLFOCUS）也走
+        // WM_COMMAND，explorer 弹窗抢/还焦点会连环触发——曾让"打开目录/日志"一次点出
+        // 多个窗口、关掉又自动重开。输入框 EN_CHANGE 等同样无需处理。
+        // IDOK/IDCANCEL 由对话框管理器合成，不走此门禁。
+        if (id != IDOK && id != IDCANCEL && code != BN_CLICKED) return TRUE;
         switch (id) {
         case IDOK: {
             c.work.service_dir = TrimW(GetText(c.dir_edt));
             c.work.port = GetInt(c.port_edt, 7863);
-            c.work.api_key_manual = TrimW(GetText(c.key_edt));
             c.work.poll_interval_sec = GetInt(c.poll_edt, 30);
             c.work.admin_poll_sec = GetInt(c.admin_edt, 60);
             c.work.credits_refresh_interval_min = GetInt(c.citv_edt, 0);
@@ -413,6 +549,7 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             c.work.auto_relaunch = SendMessageW(c.chk_relaunch, BM_GETCHECK, 0, 0) == BST_CHECKED;
             c.work.logging = SendMessageW(c.chk_log, BM_GETCHECK, 0, 0) == BST_CHECKED;
             c.work.show_live_credits = SendMessageW(c.chk_live, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            c.work.tooltip_full = SendMessageW(c.chk_tipfull, BM_GETCHECK, 0, 0) == BST_CHECKED;
             c.work.show_mode = SendMessageW(c.rad[0], BM_GETCHECK, 0, 0) == BST_CHECKED ? SM_STATE_ACCOUNT
                 : (SendMessageW(c.rad[1], BM_GETCHECK, 0, 0) == BST_CHECKED ? SM_STATE_CREDITS : SM_STATE_ONLY);
             std::wstring bad;
@@ -420,8 +557,8 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             else if (c.work.port <= 0 || c.work.port > 65535) bad = L"端口非法";
             else if (c.work.poll_interval_sec < 10 || c.work.poll_interval_sec > 600) bad = L"轮询间隔需 10–600 秒";
             else if (c.work.admin_poll_sec < 15 || c.work.admin_poll_sec > 600) bad = L"管理轮询需 15–600 秒";
-            else if (c.work.credits_refresh_interval_min != 0 && c.work.credits_refresh_interval_min < 10)
-                bad = L"自动刷新积分需 0(关) 或 ≥10 分钟";
+            else if (c.work.credits_refresh_interval_min != 0 && c.work.credits_refresh_interval_min < 1)
+                bad = L"自动刷新积分需 0(关) 或 ≥1 分钟";
             if (!bad.empty()) {
                 MessageBoxW(hDlg, bad.c_str(), L"设置未保存", MB_OK | MB_ICONWARNING);
                 return TRUE;
@@ -507,6 +644,31 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
                         Worker::Instance().RequestToggleTask(kKinds[base], ck);
                     } else if (slot == 5) {
                         Worker::Instance().RequestRunTask(kKinds[base]);
+                    } else if (slot == 7) {
+                        // 「应用」：把输入框的"9,21"解析成小时列表写回服务 config.json（重启生效）
+                        std::wstring raw = GetText(c.task[base].time);
+                        std::vector<int> hours;
+                        bool bad = false;
+                        // 按逗号（中英文皆可）/空白切分；只收 0-23 的纯数字
+                        size_t pos = 0;
+                        while (pos < raw.size() && !bad) {
+                            size_t e = raw.find_first_of(L",， \t", pos);
+                            if (e == std::wstring::npos) e = raw.size();
+                            if (e > pos) {
+                                std::wstring seg = raw.substr(pos, e - pos);
+                                int hv = _wtoi(seg.c_str());
+                                if (hv < 0 || hv > 23 ||
+                                    seg.find_first_not_of(L"0123456789") != std::wstring::npos)
+                                    bad = true;
+                                else hours.push_back(hv);
+                            }
+                            pos = e + 1;
+                        }
+                        if (bad || hours.empty())
+                            MessageBoxW(hDlg, L"触发时间需为 0-23 的小时数字，用逗号分隔（如 9,21）",
+                                L"格式不对", MB_OK | MB_ICONWARNING);
+                        else
+                            Worker::Instance().RequestSetTaskHours(kKinds[base], hours);
                     }
                 }
                 return TRUE;
@@ -519,17 +681,34 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         }
         }
     }
+    case WM_CTLCOLORDLG:
+    case WM_CTLCOLORBTN:
+        // 对话框边距与按钮贴边处默认走类刷 COLOR_BTNFACE，在白色页体旁露出浅灰带；
+        // 同样统一到页体刷。checkbox/radio 按文档走 WM_CTLCOLORSTATIC（见下），
+        // pushbutton 主题化后不消费 CTLCOLORBTN，此处只兜底非主题场景。
+        if (cp && cp->bg_brush)
+            return reinterpret_cast<INT_PTR>(cp->bg_brush);
+        return FALSE;
     case WM_CTLCOLORSTATIC: {
         HDC dc = reinterpret_cast<HDC>(wp);
         HWND h = reinterpret_cast<HWND>(lp);
         SetBkMode(dc, TRANSPARENT);
-        if (cp && (h == cp->state_lbl || h == cp->err_lbl))
+        if (!cp || !cp->bg_brush)
+            return reinterpret_cast<INT_PTR>(GetSysColorBrush(COLOR_BTNFACE));
+        // 静态控件/复选框背景与对话框同用页体色刷：原 GetSysColorBrush(COLOR_BTNFACE)
+        // 在白底主题下给每条标签拖出一圈灰带（截图里像"阴影"）。
+        if (h == cp->state_lbl || h == cp->err_lbl)
             SetTextColor(dc, cp->state_color);
-        return reinterpret_cast<INT_PTR>(GetSysColorBrush(COLOR_BTNFACE));
+        else if (std::find(cp->hints.begin(), cp->hints.end(), h) != cp->hints.end())
+            SetTextColor(dc, RGB(128, 128, 128)); // 次要说明文字
+        return reinterpret_cast<INT_PTR>(cp->bg_brush);
     }
     case WM_CLOSE:
         if (cp) { KillTimer(hDlg, 7); EndDialog(hDlg, IDCANCEL); }
         return TRUE;
+    case WM_NCDESTROY:
+        if (cp && cp->bg_brush) { DeleteObject(cp->bg_brush); cp->bg_brush = nullptr; }
+        return FALSE;
     default:
         return FALSE;
     }

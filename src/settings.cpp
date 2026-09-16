@@ -42,12 +42,12 @@ Settings ParseSettings(const json& j)
     };
     get_str("service_dir", s.service_dir);
     get_int("port", s.port);
-    get_str("api_key", s.api_key_manual);
     get_int("poll_interval_sec", s.poll_interval_sec);
     get_int("admin_poll_sec", s.admin_poll_sec);
     get_int("credits_refresh_interval_min", s.credits_refresh_interval_min);
     get_int("show_mode", s.show_mode);
     get_bool("show_live_credits", s.show_live_credits);
+    get_bool("tooltip_full", s.tooltip_full);
     get_bool("autostart_task", s.autostart_task);
     get_bool("start_with_tm", s.start_with_tm);
     get_bool("auto_relaunch", s.auto_relaunch);
@@ -58,8 +58,8 @@ Settings ParseSettings(const json& j)
     if (s.poll_interval_sec < 10) s.poll_interval_sec = 30;
     if (s.poll_interval_sec > 600) s.poll_interval_sec = 600;
     if (s.admin_poll_sec < 15) s.admin_poll_sec = 60;
-    if (s.credits_refresh_interval_min != 0 && s.credits_refresh_interval_min < 10)
-        s.credits_refresh_interval_min = 10; // 防风控下限 10 分钟（与服务端默认 600s 呼应）
+    if (s.credits_refresh_interval_min != 0 && s.credits_refresh_interval_min < 1)
+        s.credits_refresh_interval_min = 1; // 下限 1 分钟（服务端冷却兜底防风控）
     if (s.credits_refresh_interval_min > 1440) s.credits_refresh_interval_min = 1440;
     if (s.show_mode < 0 || s.show_mode > 2) s.show_mode = SM_STATE_ACCOUNT;
     s.service_dir = TrimW(s.service_dir);
@@ -78,12 +78,12 @@ json SerializeSettings(const Settings& s)
     json j;
     j["service_dir"] = WideToUtf8(s.service_dir);
     j["port"] = s.port;
-    j["api_key"] = WideToUtf8(s.api_key_manual);
     j["poll_interval_sec"] = s.poll_interval_sec;
     j["admin_poll_sec"] = s.admin_poll_sec;
     j["credits_refresh_interval_min"] = s.credits_refresh_interval_min;
     j["show_mode"] = s.show_mode;
     j["show_live_credits"] = s.show_live_credits;
+    j["tooltip_full"] = s.tooltip_full;
     j["autostart_task"] = s.autostart_task;
     j["start_with_tm"] = s.start_with_tm;
     j["auto_relaunch"] = s.auto_relaunch;
@@ -151,7 +151,6 @@ void SettingsStore::Update(const Settings& s)
 std::string SettingsStore::CurrentApiKey()
 {
     std::lock_guard<std::mutex> lk(mu_);
-    if (!cur_.api_key_manual.empty()) return WideToUtf8(TrimW(cur_.api_key_manual));
     if (cur_.service_dir.empty()) return {};
     std::wstring file = cur_.service_dir + L"\\config.json";
     HANDLE h = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,

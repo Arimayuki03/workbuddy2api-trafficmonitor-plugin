@@ -11,8 +11,7 @@
 #define IDC_EDT_DIR             1010
 #define IDC_BTN_BROWSE          1011
 #define IDC_EDT_PORT            1012
-#define IDC_EDT_KEY             1013
-#define IDC_LBL_KEYHINT         1014
+// 1013/1014 曾是 API Key 输入框/提示：v1.1 删除（鉴权自动读服务 config.json）
 #define IDC_BTN_START           1020
 #define IDC_BTN_STOP            1021
 #define IDC_BTN_RESTART         1022
@@ -34,7 +33,7 @@
 #define IDC_LBL_CNOTE           1114
 
 // ③ 定时任务（每种任务的控件集合在代码里数组管理）
-#define IDC_TASK_BASE           1200  // i*10+0 chk, +1 名称, +2 时间, +3 下次, +4 状态, +5 按钮
+#define IDC_TASK_BASE           1200  // i*10+0 chk, +2 下次, +3 状态, +5 按钮, +6 时间输入框, +7 应用按钮
 #define IDC_LBL_TASKWARN        1290
 #define IDC_BTN_RUNALL          1291
 #define IDC_LBL_TASKNOTE        1292
@@ -45,6 +44,7 @@
 #define IDC_RAD_ONLY            1302
 #define IDC_CHK_LIVECRD         1303
 #define IDC_LBL_DEMO            1304
+#define IDC_CHK_TIPFULL         1305
 
 // ⑤ 高级
 #define IDC_EDT_ADMIN           1400

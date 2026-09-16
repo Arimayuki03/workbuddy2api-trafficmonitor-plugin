@@ -1,10 +1,13 @@
 // item.cpp — 自绘实现。要点：
 //  * DrawItem 由 TM 高频调用：零网络、零分配大对象，只取预生成字符串 + 轻量状态查询；
-//  * 字体跟随宿主 DC 当前字体（任务栏/主窗口字号由 TM 决定），缓存句柄只重建一次；
-//  * 宽度按最长样例（"88/88 · 8.8k"）预留 → 数值变化不引起任务栏宽度抖动。
+//  * 字体直接克隆宿主 DC 当前字体（CDrawCommon::SetFont 已把任务栏字体选进 DC），
+//    保证与相邻栏位字号/字重一致；TM 换字体时按 (高,字重,字面) 缓存键重建；
+//  * 宽度按"当前显示模式下实际会出现的最长值"预留 → 数值变化不引起任务栏宽度抖动。
 #include "item.h"
 #include "common.h"
 #include "plugin.h"
+#include "settings.h"
+#include "trace.h"
 #include "worker.h"
 #include <algorithm>
 
@@ -19,10 +22,22 @@ StatusItem& StatusItem::Instance()
 const wchar_t* StatusItem::GetItemName() const { return L"WB2API 服务状态"; }
 const wchar_t* StatusItem::GetItemId() const { return L"WB2API_STATUS"; }
 const wchar_t* StatusItem::GetItemLableText() const { return L"WB2API"; }
-const wchar_t* StatusItem::GetItemValueSampleText() const { return L"88/88 · 8.8k"; }
+
+// 宽度预留样例：长度必须 >= 对应显示模式下 BuildDisplayLocked 实际产出的任何值
+// （Running 态 "h/t" 最多 "88/88"，积分态最长 "88.8k"/"-88.8k"，其余为短状态词）。
+// 不再混入旧的 "· 8.8k" 合并格式——那会让任务栏栏位常年多出一段空白。
+const wchar_t* StatusItem::GetItemValueSampleText() const
+{
+    switch (SettingsStore::Instance().Get().show_mode) {
+    case SM_STATE_CREDITS: return L"-88.8k"; // 积分态最长样例（含负号）
+    case SM_STATE_ONLY:    return L"无响应";  // 最长状态词（4 个全角）
+    default:               return L"88/88";  // 健康/总数
+    }
+}
 
 const wchar_t* StatusItem::GetItemValueText() const
 {
+    WB2API_TRACE_LOG("item.GetValueText");
     std::wstring v = Worker::Instance().DisplayValue();
     std::lock_guard<std::mutex> lk(val_mu_);
     val_cache_ = std::move(v);
@@ -49,37 +64,45 @@ COLORREF DotColor(SvcState s, bool dark)
 
 HFONT StatusItem::FontFor(HDC dc) const
 {
-    TEXTMETRICW tm{};
-    GetTextMetricsW(dc, &tm);
-    int h = -(int)tm.tmHeight;
-    // TEXTMETRIC 新 SDK 已无 tmFaceName：字体名改走 GetTextFaceW。
-    wchar_t facebuf[LF_FACESIZE]{};
-    std::wstring face;
-    if (GetTextFaceW(dc, LF_FACESIZE, facebuf) > 0) face = facebuf;
-    if (face.empty()) face = L"Microsoft YaHei UI";
+    // TM 绘制插件项前已把任务栏字体选进 DC（CDrawCommon::SetFont → SelectObject），
+    // 直接克隆它的 LOGFONT：字号/字重/字面与相邻栏位逐位一致。
+    // （旧实现按 -tmHeight 重建：tmHeight 含 internal leading，字号恒比宿主大一号。）
+    LOGFONTW lf{};
+    if (HFONT host = static_cast<HFONT>(GetCurrentObject(dc, OBJ_FONT)); host &&
+        GetObjectW(host, sizeof lf, &lf) && lf.lfFaceName[0] != L'\0') {
+        ; // 克隆成功
+    } else {
+        // DC 上没有可用字体（异常路径兜底）：按雅黑 + 当前字号重建。
+        TEXTMETRICW tm{};
+        GetTextMetricsW(dc, &tm);
+        lf = {};
+        lf.lfHeight = -tm.tmHeight;
+        lf.lfWeight = FW_REGULAR;
+        lf.lfCharSet = GB2312_CHARSET;
+        wcscpy_s(lf.lfFaceName, L"Microsoft YaHei UI");
+    }
     std::lock_guard<std::mutex> lk(font_mu_);
-    if (!font_ || font_height_ != h || font_face_ != face) {
+    if (!font_ || font_height_ != lf.lfHeight || font_weight_ != lf.lfWeight ||
+        font_face_ != std::wstring(lf.lfFaceName)) {
         if (font_) DeleteObject(font_);
-        LOGFONTW lf{};
-        lf.lfHeight = h;
-        lf.lfWeight = tm.tmWeight ? tm.tmWeight : FW_REGULAR;
-        lf.lfCharSet = GB2312_CHARSET; // 中文任务栏（微软雅黑系）
-        wcsncpy_s(lf.lfFaceName, face.c_str(), _TRUNCATE);
         font_ = CreateFontIndirectW(&lf);
-        font_height_ = h;
-        font_face_ = face;
+        font_height_ = lf.lfHeight;
+        font_weight_ = lf.lfWeight;
+        font_face_ = lf.lfFaceName;
     }
     return font_;
 }
 
 int StatusItem::GetItemWidth() const
 {
-    // 96dpi 兜底路径：样例 9 字符 × ~8px + 点 13 + 边距 ≈ 88
-    return 88;
+    // 96dpi 兜底路径（仅当宿主 API<3 或 WidthEx 返回 0 时被用到）：
+    // 样例 5 字符 × ~8px + 点 13 + 边距 ≈ 57
+    return 57;
 }
 
 int StatusItem::GetItemWidthEx(void* hDC) const
 {
+    WB2API_TRACE_LOG("item.WidthEx");
     HDC dc = static_cast<HDC>(hDC);
     HFONT old = static_cast<HFONT>(SelectObject(dc, FontFor(dc)));
     SIZE sz{};
@@ -91,6 +114,7 @@ int StatusItem::GetItemWidthEx(void* hDC) const
 
 void StatusItem::DrawItem(void* hDC, int x, int y, int w, int h, bool dark_mode)
 {
+    WB2API_TRACE_LOG("item.DrawItem");
     HDC dc = static_cast<HDC>(hDC);
     std::wstring text = Worker::Instance().DisplayValue();
     SvcState st = Worker::Instance().State();
@@ -120,6 +144,7 @@ void StatusItem::DrawItem(void* hDC, int x, int y, int w, int h, bool dark_mode)
 
 int StatusItem::OnMouseEvent(MouseEventType type, int, int, void* hWnd, int)
 {
+    WB2API_TRACE_LOG("item.OnMouseEvent");
     switch (type) {
     case MT_LCLICKED:
         CPluginApp::Instance().OpenSettings(static_cast<HWND>(hWnd));

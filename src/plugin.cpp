@@ -6,10 +6,13 @@
 #include "item.h"
 #include "logger.h"
 #include "settings.h"
+#include "trace.h"
 #include "worker.h"
 #include <cwchar>
 #include <thread>
 #include <chrono>
+#include <algorithm>
+#include <algorithm>
 
 namespace wb2 {
 
@@ -23,24 +26,27 @@ CPluginApp& CPluginApp::Instance()
 
 IPluginItem* CPluginApp::GetItem(int index)
 {
+    WB2API_TRACE_LOG("GetItem");
     // 只暴露 1 个显示项；越界必须返回 nullptr（TM 用 nullptr 探测结束）
     return index == 0 ? &StatusItem::Instance() : nullptr;
 }
 
 void CPluginApp::DataRequired()
 {
+    WB2API_TRACE_LOG("DataRequired");
     // 数据由 worker 线程自取；这里只兜底启动（有的 TM 版本先调 DataRequired 再 OnInitialize）
     Worker::Instance().Start();
 }
 
 const wchar_t* CPluginApp::GetInfo(PluginInfoIndex index)
 {
+    WB2API_TRACE_LOG("GetInfo");
     switch (index) {
     case TMI_NAME: return L"WorkBuddy2API";
     case TMI_DESCRIPTION: return L"workbuddy2api 服务状态监控与手动控制（loopback 本地接口）";
     case TMI_AUTHOR: return L"Arima";
     case TMI_COPYRIGHT: return L"MIT License";
-    case TMI_VERSION: return L"1.0.0";
+    case TMI_VERSION: return L"1.1.0";
     case TMI_URL: return L"https://github.com/Arimayuki03/workbuddy2api-trafficmonitor-plugin";
     default: return L"";
     }
@@ -49,7 +55,21 @@ const wchar_t* CPluginApp::GetInfo(PluginInfoIndex index)
 const wchar_t* CPluginApp::GetTooltipInfo()
 {
     std::wstring t = Worker::Instance().TooltipText();
+    WB2API_TRACE_LOG("GetTooltipInfo");
     if (t.empty()) t = L"WorkBuddy2API：等待首次轮询…";
+#ifdef WB2API_TRACE_BUILD
+    {
+        std::wstring note = WideFormat(L"GetTooltipInfo len=%zu lines=%zu",
+            t.size(), static_cast<size_t>(std::count(t.begin(), t.end(), L'\n')) + 1);
+        trace::Write(std::string(note.begin(), note.end()).c_str());
+    }
+#endif
+#ifdef WB2API_TRACE_AB_EMPTY
+    // A/B：把我们的 tooltip 压成一行短句，验证"三插件总长超限"假设
+    static thread_local std::wstring short_tip;
+    short_tip = L"WorkBuddy2API";
+    return short_tip.c_str();
+#endif
     std::lock_guard<std::mutex> lk(tt_mu_);
     tt_cache_ = std::move(t);
     return tt_cache_.c_str();
@@ -63,23 +83,26 @@ COLORREF CPluginApp::ValueTextColor(bool dark_mode) const
 
 void CPluginApp::OnExtenedInfo(ExtendedInfoIndex index, const wchar_t* data)
 {
-    auto parse_color = [](const wchar_t* s, COLORREF& out) {
-        if (!s || !*s) return;
+    WB2API_TRACE_LOG("OnExtenedInfo");
+    auto parse_color = [](const wchar_t* s, COLORREF& out) -> bool {
+        if (!s || !*s) return false;
         wchar_t* end{};
         long v = wcstol(s, &end, 10);
         if (end == s) {
             v = wcstol(s, &end, 16); // 十六进制容错
-            if (end == s) return;
+            if (end == s) return false;
         }
         out = static_cast<COLORREF>(v) & 0xFFFFFF;
+        return true;
     };
     switch (index) {
     case EI_LABEL_TEXT_COLOR:
-        parse_color(data, label_color_);
-        colors_set_ = true;
+        parse_color(data, label_color_); // 自绘不使用标签色，仅留存
         break;
     case EI_VALUE_TEXT_COLOR:
-        parse_color(data, value_color_);
+        // 只有数值色真正解析成功才启用自定义色：label_color_ 没有消费者，
+        // 不能让"标签色先到"决定 ValueTextColor 走不走 value_color_。
+        if (parse_color(data, value_color_)) colors_set_ = true;
         break;
     case EI_CONFIG_DIR:
         if (data) SettingsStore::Instance().Init(data);
@@ -91,6 +114,7 @@ void CPluginApp::OnExtenedInfo(ExtendedInfoIndex index, const wchar_t* data)
 
 void CPluginApp::OnInitialize(ITrafficMonitor* pApp)
 {
+    WB2API_TRACE_LOG("OnInitialize");
     app_ = pApp;
     EnsureInited();
 }
@@ -142,10 +166,11 @@ int SettingIndex(int idx) { return idx - 17; }  // 17..19 → 0..2
 } // namespace
 
 // 布局：0启动 1停止 2重启 3设置 4积分 | 5..10 立即执行 | 11..16 启用勾选 | 17..19 开关勾选
-int CPluginApp::GetCommandCount() { return 20; }
+int CPluginApp::GetCommandCount() { WB2API_TRACE_LOG("GetCommandCount"); return 20; }
 
 const wchar_t* CPluginApp::GetCommandName(int command_index)
 {
+    WB2API_TRACE_LOG("GetCommandName");
     static thread_local std::wstring buf;
     const wchar_t* names[5] = { L"启动服务", L"停止服务", L"重启服务", L"打开设置…", L"查询实时积分" };
     if (command_index >= 0 && command_index < 5) return names[command_index];
@@ -163,6 +188,7 @@ const wchar_t* CPluginApp::GetCommandName(int command_index)
 
 int CPluginApp::IsCommandChecked(int command_index)
 {
+    WB2API_TRACE_LOG("IsCommandChecked");
     if (command_index >= 11 && command_index < 17) {
         Snapshot sn = Worker::Instance().Copy();
         if (!sn.admin_available) return 0;
@@ -184,6 +210,7 @@ int CPluginApp::IsCommandChecked(int command_index)
 
 void CPluginApp::OnPluginCommand(int command_index, void* hWnd, void*)
 {
+    WB2API_TRACE_LOG("OnPluginCommand");
     HWND parent = static_cast<HWND>(hWnd);
     auto& wk = Worker::Instance();
     if (command_index == 0) wk.RequestStartService();
@@ -233,6 +260,7 @@ void CPluginApp::OnPluginCommand(int command_index, void* hWnd, void*)
 
 ITMPlugin::OptionReturn CPluginApp::ShowOptionsDialog(void* hParent)
 {
+    WB2API_TRACE_LOG("ShowOptionsDialog");
     return dlg::ShowSettingsDialog(static_cast<HWND>(hParent));
 }
 
@@ -251,7 +279,35 @@ extern "C" {
 
 __declspec(dllexport) ITMPlugin* TMPluginGetInstance()
 {
+    WB2API_TRACE_LOG("export.TMPluginGetInstance");
     return &wb2::CPluginApp::Instance();
+}
+
+// 排查辅助：记录所有 first-chance 异常的地址与调用栈（弹"遇到不适当的参数"时能看到抛点）。
+static LONG WINAPI VectoredExcept(PEXCEPTION_POINTERS ep)
+{
+    HMODULE hm = nullptr;
+    char mod[64] = "?";
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(ep->ExceptionRecord->ExceptionAddress), &hm) && hm) {
+        char name[MAX_PATH] = "?";
+        GetModuleFileNameA(hm, name, MAX_PATH);
+        const char* slash = strrchr(name, '\\');
+        _snprintf_s(mod, sizeof mod, _TRUNCATE, "%s", slash ? slash + 1 : name);
+    }
+    wb2::trace::ExceptRecord("vectored", ep->ExceptionRecord->ExceptionCode,
+        ep->ExceptionRecord->ExceptionAddress);
+    char line[160];
+    _snprintf_s(line, sizeof line, _TRUNCATE, "except code=%08lX addr=%p mod=%s",
+        ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress, mod);
+    wb2::trace::Write(line);
+    // C++ 异常（0xE06D7363）：抓调用栈看 throw 点在哪
+    if (ep->ExceptionRecord->ExceptionCode == 0xE06D7363) {
+        void* frames[24]{};
+        USHORT got = CaptureStackBackTrace(0, 24, frames, nullptr);
+        wb2::trace::StackRecord(frames, got);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
@@ -259,6 +315,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
     if (reason == DLL_PROCESS_ATTACH) {
         wb2::g_hInst = hModule;
         DisableThreadLibraryCalls(hModule);
+        wb2::trace::Init();
+        if (wb2::trace::Active()) // 仅诊断构建/显式开启时注册，避免给宿主加全局异常钩子
+            AddVectoredExceptionHandler(1, VectoredExcept);
     } else if (reason == DLL_PROCESS_DETACH) {
         wb2::Worker::Instance().Stop(); // TM 卸载/退出前停线程（join 有超时上限，不会卡死）
     }

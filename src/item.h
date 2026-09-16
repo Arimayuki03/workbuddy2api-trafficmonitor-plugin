@@ -24,12 +24,13 @@ public:
 
 private:
     StatusItem() = default;
-    // 字体跟随宿主 DC 当前字体（缓存句柄，尺寸变化才重建；进程退出随 TM 释放无所谓）
+    // 字体克隆宿主 DC 当前字体（缓存句柄，(高,字重,字面) 变了才重建；随 TM 生命周期释放）
     HFONT FontFor(HDC dc) const;
     mutable std::mutex font_mu_;
     mutable HFONT font_{};
-    mutable int font_height_{};      // 负值 lfHeight
-    mutable std::wstring font_face_;
+    mutable int font_height_{};      // 克隆的 lfHeight
+    mutable LONG font_weight_{};     // 克隆的 lfWeight
+    mutable std::wstring font_face_; // 克隆的 lfFaceName
 
     mutable std::mutex val_mu_;
     mutable std::wstring val_cache_; // GetItemValueText 返回值的宿主缓冲

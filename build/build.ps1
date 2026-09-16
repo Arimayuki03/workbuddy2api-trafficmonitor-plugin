@@ -14,13 +14,13 @@ $cfg = if ($env:CFG) { $env:CFG } else { 'Release' }
 $out = Join-Path $root "build\out\$cfg"
 New-Item -ItemType Directory -Force -Path $out | Out-Null
 
-$srcs = @('common','logger','settings','http','procctl','autostart','worker','item','plugin','dialogs') |
+$srcs = @('common','logger','settings','http','procctl','autostart','worker','item','plugin','dialogs','trace') |
     ForEach-Object { Join-Path $root "src\$_.cpp" }
 $srcList = $srcs -join ' '
 
 $cppFlags = "/nologo /std:c++17 /EHsc /W3 /utf-8 /DNDEBUG /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /O2 /MT /I`"$root\include`" /I`"$root\third_party`" /I`"$root\res`""
 $rcFlags  = "/nologo /DUNICODE /D_UNICODE /fo plugin.res /I`"$root\res`" /I`"$root\include`""
-$objs = (@('common','logger','settings','http','procctl','autostart','worker','item','plugin','dialogs') |
+$objs = (@('common','logger','settings','http','procctl','autostart','worker','item','plugin','dialogs','trace') |
     ForEach-Object { "$_.obj" }) -join ' '
 
 $lines = @(
@@ -29,7 +29,7 @@ $lines = @(
     "cd /d `"$out`" || exit /b 1",
     "rc.exe $rcFlags `"$root\res\plugin.rc`" || exit /b 2",
     "cl.exe $cppFlags /c $srcList || exit /b 3",
-    "link.exe /nologo /DLL /MACHINE:X64 /SUBSYSTEM:WINDOWS /OUT:WorkBuddy2ApiPlugin.dll $objs plugin.res user32.lib gdi32.lib shell32.lib ole32.lib shlwapi.lib iphlpapi.lib winhttp.lib comctl32.lib ws2_32.lib advapi32.lib || exit /b 4",
+    "link.exe /nologo /DLL /MACHINE:X64 /SUBSYSTEM:WINDOWS /OUT:WorkBuddy2ApiPlugin.dll $objs plugin.res user32.lib gdi32.lib shell32.lib ole32.lib shlwapi.lib iphlpapi.lib winhttp.lib comctl32.lib uxtheme.lib ws2_32.lib advapi32.lib || exit /b 4",
     'echo BUILD-OK'
 )
 $bat = ($lines -join "`r`n") + "`r`n"

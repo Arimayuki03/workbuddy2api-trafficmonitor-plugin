@@ -53,8 +53,9 @@ Listener FindPortListener(int port)
         const MIB_TCP6TABLE_OWNER_PID* t6 = reinterpret_cast<const MIB_TCP6TABLE_OWNER_PID*>(buf.data());
         if (net == AF_INET) {
             for (DWORD i = 0; i < t->dwNumEntries; i++) {
-                // localPort 低字节为主机序端口（网络序高 16 位无用）
-                if ((t->table[i].dwLocalPort & 0xFFFF) == static_cast<WORD>(port)) {
+                // dwLocalPort 的低 16 位按网络字节序存端口（实测 7863 的原始值为 0x0000B71E），
+                // 必须 ntohs 转主机序后再比较。与下方 IPv6 分支的 ntohl(x)>>16 等价。
+                if (ntohs(static_cast<WORD>(t->table[i].dwLocalPort & 0xFFFF)) == static_cast<WORD>(port)) {
                     r.found = true;
                     r.pid = t->table[i].dwOwningPid;
                     r.exe_path = QueryImagePath(r.pid);
@@ -62,7 +63,7 @@ Listener FindPortListener(int port)
             }
         } else {
             for (DWORD i = 0; i < t6->dwNumEntries; i++) {
-                // IPv6 表 localPort 是大端 DWORD 高位 16 位放端口
+                // 实测 IPv6 表同样低 16 位网络序；ntohl(x)>>16 恒等于 ntohs(x&0xFFFF)，公式保留。
                 if ((ntohl(t6->table[i].dwLocalPort) >> 16) == static_cast<DWORD>(port)) {
                     r.found = true;
                     r.pid = t6->table[i].dwOwningPid;

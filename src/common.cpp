@@ -38,18 +38,19 @@ std::wstring FormatCreditsCompact(int64_t v)
 {
     uint64_t a = v < 0 ? static_cast<uint64_t>(-v) : static_cast<uint64_t>(v);
     if (a < 10000) return std::to_wstring(v);
-    // k 表示法：一位小数，整倍去尾（56.0k→56k）。
+    // k 表示法：一位小数，整倍去尾（56.0k→56k）。不带空格——
+    // 与 GetItemValueSampleText("-88.8k") 一致，保证宽度预留准确。
     long double k = static_cast<long double>(v) / 1000.0L;
     wchar_t buf[32];
     if (a >= 100000)
-        swprintf(buf, 32, L"%.0Lf k", k);
+        swprintf(buf, 32, L"%.0Lfk", k);
     else {
-        swprintf(buf, 32, L"%.1Lf k", k);
+        swprintf(buf, 32, L"%.1Lfk", k);
     }
     std::wstring s(buf);
-    // "56.0 k" → "56 k"
-    if (s.size() > 4 && s.compare(s.size() - 5, 5, L".0 k") == 0)
-        s.replace(s.size() - 5, 4, L"");
+    // "56.0k" → "56k"
+    if (s.size() > 4 && s.compare(s.size() - 3, 3, L".0k") == 0)
+        s.replace(s.size() - 3, 2, L"");
     return s;
 }
 

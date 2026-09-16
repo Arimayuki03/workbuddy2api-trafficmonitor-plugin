@@ -48,6 +48,8 @@ struct TaskInfo {
 struct CreditRow {
     std::wstring uid8, nickname;
     int64_t remain = -1;      // -1 = 该号查询失败
+    int64_t used = -1;        // 累计已用（账号原始总量口径的消耗部分）；-1 = 未知
+    int64_t size = -1;        // 套餐总量（remain+used 的原始总额度）；-1 = 未知
     bool ok = false;
     std::wstring error;
 };
@@ -57,6 +59,7 @@ struct CreditsInfo {
     bool have = false;        // 服务端至少成功查过一次
     int64_t ts = 0;           // 查询完成时间
     int64_t total_remain = -1;
+    int64_t total_used = -1;  // 全部账号已用合计
     std::vector<CreditRow> rows;
     int64_t cooldown_until = 0; // 服务端下次可查时间（unix 秒）
 };

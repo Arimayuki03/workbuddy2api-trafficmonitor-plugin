@@ -151,6 +151,20 @@ HWND MkEdit(Ctx& c, LPCWSTR t, int l, int tp, int w, int id, int page, DWORD ext
 LRESULT CALLBACK AccListProc(HWND h, UINT msg, WPARAM wp, LPARAM lp,
     UINT_PTR id, DWORD_PTR ref)
 {
+    // 列宽拖动（HDN_ITEMCHANGING/CHANGED，含双击分隔线自适应）：ListView 默认绘制只
+    // 增量重绘受影响区域，浅色主题的网格线会在被拖列的旧位置留下竖线残影。默认处理后
+    // 强制整客户区重绘——行列线永远按最新列宽整帧画，拖动实时反馈照常保留。
+    // 配合 LVS_EX_DOUBLEBUFFER：重绘先进内存位图再整帧上屏，不会"擦背景→画内容"
+    // 两段式交替出现的白闪。只在 ITEMCHANGED（宽度确实变了）后重绘，ITEMCHANGING
+    // 每像素拖动会连发多次，多绘无益。
+    if (msg == WM_NOTIFY) {
+        LPNMHEADERW nm = reinterpret_cast<LPNMHEADERW>(lp);
+        if (nm && nm->hdr.code == HDN_ITEMCHANGEDW) {
+            LRESULT r = DefSubclassProc(h, msg, wp, lp);
+            InvalidateRect(h, nullptr, FALSE);
+            return r;
+        }
+    }
     LRESULT r = DefSubclassProc(h, msg, wp, lp);
     if (msg == WM_PAINT) {
         // 表头高度：表头客户区与列表客户区同原点(顶部满宽)，item0 的 bottom 即高度。
@@ -239,12 +253,59 @@ void FillAccountList(Ctx& c, const Snapshot& sn)
         setcol(3, livev);
         std::wstring st;
         if (a.disabled) st = a.reason.empty() ? L"已禁用" : L"已禁用 " + a.reason;
-        else if (a.cooling) st = a.until > NowSecX() ? L"冷却至 " + FormatTimeShort(a.until) : L"冷却中";
+        else if (a.cooling) {
+            // 服务端 cooling 是三合一口径（冷却/熔断/连败降权任一未到期）。按"哪一翼
+            // 撑到最远"细分标注，降权再带上连败计数（阈值 5 次，见服务端 degrade_threshold）。
+            int64_t nowx = NowSecX();
+            if (a.degrade_until > nowx && a.degrade_until >= a.until && a.degrade_until >= a.breaker_until)
+                st = WideFormat(L"降权至 %s(连败%d)", FormatTimeShort(a.degrade_until).c_str(), a.consec_fails);
+            else if (a.breaker_until > nowx && a.breaker_until >= a.until)
+                st = L"熔断至 " + FormatTimeShort(a.breaker_until);
+            else
+                st = a.until > nowx ? L"冷却至 " + FormatTimeShort(a.until) : L"冷却中";
+        }
+        else if (a.rl_models > 0) st = a.rl_until > NowSecX()
+            ? WideFormat(L"模型限额×%d(至%s)", (int)a.rl_models, FormatTimeShort(a.rl_until).c_str())
+            : WideFormat(L"模型限额×%d", (int)a.rl_models);
         else if (a.in_flight > 0) st = WideFormat(L"请求中(%d)", a.in_flight);
         else st = L"正常";
         setcol(4, st);
         setcol(5, a.token_expiry > NowSecX()
             ? WideFormat(L"%lld天", (a.token_expiry - NowSecX()) / 86400) : L"-");
+    }
+}
+
+// 账户表列宽一次性预设：设计列宽按 96 DPI 标定（昵称88 域34 估算58 状态76 令牌剩50，
+// 实时列吃余量），乘以"客户区实际宽 ÷ 设计总宽"的缩放系数分给固定列——高 DPI 下
+// 控件像素变宽、列宽同步变大，恰好填满、不留无表头的空列（固定像素对不上控件宽
+// 的截图 bug 来源）。只在建表时调一次，之后永不重设：运行期自适应会在 WM_SIZE/
+// 翻页时把用户手动拖好的列宽弹回去（体验差，也造成表格闪动）。
+void FitAccountColumnsOnce(Ctx& c)
+{
+    if (!c.acc_list) return;
+    RECT rc{};
+    GetClientRect(c.acc_list, &rc);
+    int total = rc.right - rc.left;
+    if (total <= 0) return; // 页②还没显示过：翻到页②时客户区才有宽
+    static const int kDesign[] = { 88, 34, 58, 0, 76, 50 }; // 下标 3 = 实时列（吃余量）
+    const int kFixedDesign = 88 + 34 + 58 + 76 + 50;        // 固定列设计合计 306
+    const int kTotalDesign = kFixedDesign + 152;            // + 实时列设计宽 152 = 458
+    int fixed = kFixedDesign * total / kTotalDesign;
+    int live = total - fixed;
+    if (live < 60) live = 60; // 极窄窗口下实时列保底可读
+    // 累计取整：每列宽 = 缩放后的前缀和差值，整数除法误差不累计，总和恰好填满
+    int prefix = 0, prev_end = 0;
+    for (int i = 0; i < 6; i++) {
+        int w;
+        if (!kDesign[i]) {
+            w = live;
+        } else {
+            prefix += kDesign[i];
+            int end = prefix * fixed / kFixedDesign;
+            w = end - prev_end;
+            prev_end = end;
+        }
+        ListView_SetColumnWidth(c.acc_list, i, w);
     }
 }
 
@@ -425,10 +486,13 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         cp->action_lbl = MkLabel(*cp, L" ", 8, 188, 404, 10, 0);
 
         // —— 页② 账户与积分 ——
-        // 实时列含"剩余（已用/总量）"，需要更宽：列宽 66+54+46+180+62+50=458，列表框 462。
+        // 列宽一次性预设（见 FitAccountColumnsOnce）：建表时按客户区宽定死，之后
+        // 不随窗口缩放/翻页重设——用户可自由拖动列宽，不会被弹回。
         cp->acc_list = MkWnd(*cp, WC_LISTVIEWW, L"",
             LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER, 0, 8, 8, 462, 140, IDC_LST_ACC, 1);
-        ListView_SetExtendedListViewStyle(cp->acc_list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+        // LVS_EX_DOUBLEBUFFER：列表整帧先进内存位图再上屏，拖列宽/滚动的重绘不闪。
+        ListView_SetExtendedListViewStyle(cp->acc_list,
+            LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
         // 默认 aero 主题下 LVS_EX_GRIDLINES 的竖线与表头分隔线错位数像素、表头下沿缺一条
         // 横线（经典毛病）。切 Explorer 主题后表头与网格线走同一套绘制，行列线对齐。
         SetWindowTheme(cp->acc_list, L"Explorer", nullptr);
@@ -442,14 +506,18 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             cv.cx = cols[i].w;
             ListView_InsertColumn(cp->acc_list, i, &cv);
         }
+        // 建表后一次性定列宽：此刻客户区宽即初始可视宽，之后不再重设（可自由拖动）。
+        FitAccountColumnsOnce(*cp);
         cp->btn_cred = MkBtn(*cp, L"查询实时积分", 8, 156, 80, 14, IDC_BTN_CRED, 1);
         cp->lbl_cool = MkLabel(*cp, L"", 94, 158, 370, 10, 1);
         MkLabel(*cp, L"自动刷新周期(分钟,0=关,≥1):", 8, 178, 150, 10, 1);
         cp->citv_edt = MkEdit(*cp, std::to_wstring(cp->work.credits_refresh_interval_min).c_str(), 160, 176, 34, IDC_EDT_CINTERVAL, 1, ES_NUMBER);
         MkHint(*cp, L"估算=本地账本，插件轮询零成本；实时=服务端逐号查上游余额并回写账本，括号内为该号已用/原始总量。",
             8, 194, 404, 10, 1);
-        MkHint(*cp, L"自动刷新默认关闭，开也要 ≥1 分钟（服务端还有默认 10 分钟冷却做第二道闸，太密会被 429 挡回）。",
+        MkHint(*cp, L"周期保存时自动同步到服务端冷却（PATCH /admin/credits-interval，免重启、写回服务端 config.json 留 .bak）。",
             8, 206, 404, 10, 1);
+        MkHint(*cp, L"插件只按服务端允许的节奏查询，不会触发 429；双击账户行可看该号每模型实测成本台账。",
+            8, 218, 404, 10, 1);
 
         // —— 页③ 定时任务 ——
         // 表头一行 + 每任务一行：勾选 | 触发时间(可编辑) | 下次 | 上次/状态 | 立即执行 | 应用。
@@ -506,7 +574,7 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         MkBtn(*cp, L"打开服务目录", 112, 46, 80, 14, IDC_BTN_OPENSVC, 4);
         MkBtn(*cp, L"打开服务日志", 196, 46, 80, 14, IDC_BTN_OPENLOG, 4);
         MkBtn(*cp, L"打开插件日志", 280, 46, 80, 14, IDC_BTN_OPENPLOG, 4);
-        MkLabel(*cp, L"WorkBuddy2API TrafficMonitor 插件 v1.1.0 · MIT", 8, 70, 404, 10, 4);
+        MkLabel(*cp, L"WorkBuddy2API TrafficMonitor 插件 v1.2.0 · MIT", 8, 70, 404, 10, 4);
         MkHint(*cp, L"https://github.com/Arimayuki03/workbuddy2api-trafficmonitor-plugin", 8, 84, 404, 10, 4);
         MkHint(*cp, L"设计约束：/healthz /status /admin 均为本机回环接口；本插件永不调用 /v1/chat/completions，", 8, 104, 460, 10, 4);
         MkHint(*cp, L"与你的 API 使用互不影响。实时积分查询由服务端冷却与单飞兜底，防止任何路径触发上游风控。", 8, 118, 460, 10, 4);
@@ -524,6 +592,33 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         LPNMHDR nh = reinterpret_cast<LPNMHDR>(lp);
         if (nh->idFrom == IDC_TAB && nh->code == TCN_SELCHANGE) {
             ShowPage(*cp, static_cast<int>(TabCtrl_GetCurSel(cp->tab)));
+            return TRUE;
+        }
+        // 双击（或回车）账户行 → 该号每模型实测成本台账（/status accounts[].model_costs，
+        // wb2api 上游 2493532 透出）。口径与 wb2api 的 status-report.ps1 一致：
+        // 每1k=实测千 token 均价（EMA，≤0 即实测免费），6 小时无观测服务端自动删行。
+        if (cp->acc_list && nh->hwndFrom == cp->acc_list && nh->code == LVN_ITEMACTIVATE) {
+            int idx = (int)ListView_GetNextItem(cp->acc_list, -1, LVNI_SELECTED);
+            Snapshot sn = Worker::Instance().Copy();
+            if (idx < 0 || idx >= (int)sn.accounts.size()) return TRUE;
+            const AccountInfo& a = sn.accounts[idx];
+            std::wstring box = a.nickname + L"（" + (a.realm.empty() ? L"cn" : a.realm) +
+                L"）每模型实测成本\n\n";
+            if (a.costs.empty()) {
+                box += L"（暂无观测：该号还没处理过可记账的请求，或观测已过 6 小时被服务端回收）";
+            } else {
+                box += L"模型｜每1k均价｜样本｜末次观测\n";
+                for (auto& m : a.costs) {
+                    // 3 位小数（同 status-report.ps1 的 N3 口径）：实测单价常见 0.00x 量级，
+                    // 2 位会把 0.0034 显示成 "0.00"，与"免费"混淆。
+                    box += WideFormat(L"%s｜%s｜%d｜%s\n", m.model.c_str(),
+                        m.per1k <= 0 ? L"免费" : WideFormat(L"%.3f", m.per1k).c_str(),
+                        m.samples,
+                        m.last_seen ? FormatTimeShort(m.last_seen).c_str() : L"-");
+                }
+                box += L"\n选号按便宜优先；≤0=实测免费，数字为积分/千 token。";
+            }
+            MessageBoxW(hDlg, box.c_str(), L"成本台账", MB_OK);
             return TRUE;
         }
         return FALSE;
@@ -557,11 +652,23 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             else if (c.work.port <= 0 || c.work.port > 65535) bad = L"端口非法";
             else if (c.work.poll_interval_sec < 10 || c.work.poll_interval_sec > 600) bad = L"轮询间隔需 10–600 秒";
             else if (c.work.admin_poll_sec < 15 || c.work.admin_poll_sec > 600) bad = L"管理轮询需 15–600 秒";
-            else if (c.work.credits_refresh_interval_min != 0 && c.work.credits_refresh_interval_min < 1)
-                bad = L"自动刷新积分需 0(关) 或 ≥1 分钟";
+            else if (c.work.credits_refresh_interval_min < 0 || c.work.credits_refresh_interval_min > 1440)
+                bad = L"自动刷新积分需 0(关) 或 1–1440 分钟";
             if (!bad.empty()) {
                 MessageBoxW(hDlg, bad.c_str(), L"设置未保存", MB_OK | MB_ICONWARNING);
                 return TRUE;
+            }
+            // 积分自动刷新周期先于落盘同步到服务端：改失败只提示不阻断保存
+            // （服务端可能未升级/未开 admin），插件侧仍按本地值尽力而为。
+            if (c.work.credits_refresh_interval_min != c.orig.credits_refresh_interval_min) {
+                SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+                std::wstring sync_err = Worker::Instance().SyncCreditsIntervalBlocking(
+                    c.work.credits_refresh_interval_min);
+                if (!sync_err.empty()) {
+                    MessageBoxW(hDlg, (L"周期已保存到插件，但同步服务端失败：\n" + sync_err +
+                        L"\n\n服务端仍按其 config.json 里的冷却执行；升级 wb2api 后重试。").c_str(),
+                        L"服务端冷却同步失败", MB_OK | MB_ICONWARNING);
+                }
             }
             if (c.work.autostart_task != c.orig.autostart_task) {
                 SetCursor(LoadCursorW(nullptr, IDC_WAIT));
@@ -599,6 +706,12 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_BTN_RESTART: Worker::Instance().RequestRestartService(); return TRUE;
         case IDC_BTN_CRED: Worker::Instance().RequestRefreshCredits(); return TRUE;
         case IDC_BTN_BROWSE: {
+            // SHBrowseForFolderW 内部走 COM（shell folder 枚举）且要求调用线程是 STA。
+            // 插件对话框线程从未初始化 COM：弹窗内部消息循环等一个永远不会到的跨套间
+            // 回应，整个设置窗（连同宿主 UI 线程）直接卡死。任何返回值都配对
+            // CoUninitialize；同线程已初始化过（S_FALSE/SEC 重点）也不多还一次。
+            HRESULT cohr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+            if (FAILED(cohr)) return TRUE; // COM 起不来：放弃弹窗也不能吊死 UI
             BROWSEINFOW bi{};
             bi.hwndOwner = hDlg;
             bi.lpszTitle = L"选择 workbuddy2api 服务目录（含 wb2api.exe 的文件夹）";
@@ -609,6 +722,7 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
                 if (SHGetPathFromIDListW(pidl, path.data())) SetWindowTextW(c.dir_edt, path.data());
                 CoTaskMemFree(pidl);
             }
+            CoUninitialize();
             return TRUE;
         }
         case IDC_BTN_OPENCFG:

@@ -40,6 +40,11 @@ public:
     bool RequestSetTaskHours(const std::string& kind, const std::vector<int>& hours); // 写回服务 config.json（重启生效）
     bool RequestRefreshCredits();
     bool IsActionBusy(const std::string& key) const;         // "svc"/"credits"/"task:<kind>"
+    // 把实时积分自动刷新周期同步到服务端冷却（PATCH /admin/credits-interval，
+    // 热生效+写回服务 config.json；服务端区间 60–86400 秒）。minutes<=0（关闭自动
+    // 刷新）不下发、直接返回成功。阻塞调用（保存按钮路径，UI 线程专用）；
+    // 返回空串=成功，非空=中文错误。
+    std::wstring SyncCreditsIntervalBlocking(int minutes);
 
     void RefreshSoon();              // 请求下一循环立即跑（动作完成后调用）
 

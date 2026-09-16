@@ -20,16 +20,35 @@ enum class SvcState {
 
 inline bool StateIsOn(SvcState s) { return s == SvcState::Running || s == SvcState::Unservable || s == SvcState::Starting; }
 
+// 每模型实测成本台账行（wb2api /status accounts[].model_costs，上游 2493532）：
+// per1k=实测每千 token 均价（EMA，≤0=实测免费）；6 小时无观测服务端即删行。
+struct ModelCost {
+    std::wstring model;
+    double per1k = 0;
+    int samples = 0;          // 累计观测次数（EMA 收敛度参考）
+    int64_t last_seen = 0;    // 末次观测（unix 秒）
+};
+
 struct AccountInfo {
     std::string uid;          // 原始 uid（auths 文件扫描合并用，不上界面）
     std::wstring uid8;
     std::wstring nickname;
     std::wstring realm;
     int64_t credits = 0;      // /status 估算
+    // 服务端 cooling 标志是"三合一"口径：until（账号级冷却）、breaker_until（熔断）、
+    // degrade_until（连败降权，上游 #114）任一未到期即为 true。恢复时刻展示取三者最远。
     bool cooling = false;
     bool disabled = false;
     std::wstring reason;
-    int64_t until = 0;        // 冷却至（unix 秒；0=无）
+    int64_t until = 0;            // 账号级冷却至（unix 秒；0=无）
+    int64_t breaker_until = 0;    // 熔断截止（0=无）
+    int64_t degrade_until = 0;    // 连败降权截止（0=无）
+    int consec_fails = 0;         // 连续失败计数（降权进度）
+    // 模型级限额（issue #36）：账号整体健康、个别模型仍在独立冷却。
+    // 非空即这些模型暂不可用，其他模型照常可选。
+    size_t rl_models = 0;
+    int64_t rl_until = 0;         // 限额模型中最远恢复时刻
+    std::vector<ModelCost> costs; // 成本台账（双击账户行弹窗展示）
     int in_flight = 0;
     int64_t token_expiry = 0; // 本地 auths 文件扫描（unix 秒；0=未知）
 };
@@ -75,7 +94,9 @@ struct Snapshot {
     // /status
     std::vector<AccountInfo> accounts;
     bool accounts_valid = false;  // /status 至少成功解析过一次（tooltip 显示账户区的前提）
-    int cooling = 0, disabled_n = 0, sticky = 0;
+    // in_flight_full：健康但在途名额占满的账号数（账号在此计数里是 healthy，
+    // 但 chat 实际选不到它——全占满时 healthz 按 ServableNow 口径仍报 503）。
+    int cooling = 0, disabled_n = 0, sticky = 0, in_flight_full = 0;
     int64_t status_ts = 0;
 
     // /admin/*

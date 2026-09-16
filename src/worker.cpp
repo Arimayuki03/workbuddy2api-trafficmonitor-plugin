@@ -12,6 +12,7 @@
 #include <nlohmann/json.hpp>
 #include <cstdio>
 #include <ctime>
+#include <cmath>
 #include <map>
 
 using json = nlohmann::json;
@@ -36,6 +37,12 @@ std::string JStr(const json& j, const char* k)
     auto it = j.find(k);
     if (it == j.end() || !it->is_string()) return {};
     return it->get<std::string>();
+}
+double JNum(const json& j, const char* k, double d = 0)
+{
+    auto it = j.find(k);
+    if (it == j.end() || !it->is_number()) return d;
+    return it->get<double>();
 }
 
 // RFC3339 → unix 秒；"0001-01-01..." 零值与空串一律 0（=无）。
@@ -288,6 +295,7 @@ void Worker::PollOnce()
             if (sj.is_object()) {
                 patch.cooling = (int)JInt(sj, "cooling");
                 patch.disabled_n = (int)JInt(sj, "disabled");
+                patch.in_flight_full = (int)JInt(sj, "in_flight_full");
                 patch.sticky = (int)JInt(sj, "sticky_sessions");
                 if (sj.contains("accounts") && sj["accounts"].is_array()) {
                     for (auto& a : sj["accounts"]) {
@@ -303,6 +311,34 @@ void Worker::PollOnce()
                         ai.disabled = JBool(a, "disabled");
                         ai.until = RfcToUnix(JStr(a, "until"));
                         ai.reason = Utf8ToWide(JStr(a, "reason"));
+                        if (ai.disabled && ai.reason.empty())
+                            ai.reason = Utf8ToWide(JStr(a, "disabled_reason"));
+                        // 三合一冷却的另外两翼：熔断与连败降权（上游 #114）。
+                        // 服务端 Cooling=true 时可能是三者任一，恢复时刻展示取最远。
+                        ai.breaker_until = RfcToUnix(JStr(a, "breaker_until"));
+                        ai.degrade_until = RfcToUnix(JStr(a, "degrade_until"));
+                        ai.consec_fails = (int)JInt(a, "consecutive_fails");
+                        // 模型级限额（issue #36）：账号健康但这些模型还在独立冷却。
+                        if (a.contains("rate_limited_models") && a["rate_limited_models"].is_array()) {
+                            for (auto& m : a["rate_limited_models"]) {
+                                if (!m.is_object()) continue;
+                                ai.rl_models++;
+                                int64_t mu = RfcToUnix(JStr(m, "until"));
+                                if (mu > ai.rl_until) ai.rl_until = mu;
+                            }
+                        }
+                        // 成本台账（上游 2493532）：每模型一行，双行弹窗展示（不进 tooltip，控长度）。
+                        if (a.contains("model_costs") && a["model_costs"].is_array()) {
+                            for (auto& m : a["model_costs"]) {
+                                if (!m.is_object()) continue;
+                                ModelCost mc;
+                                mc.model = Utf8ToWide(JStr(m, "model"));
+                                mc.per1k = JNum(m, "cost_per_1k");
+                                mc.samples = (int)JInt(m, "samples");
+                                mc.last_seen = RfcToUnix(JStr(m, "last_seen"));
+                                ai.costs.push_back(std::move(mc));
+                            }
+                        }
                         ai.in_flight = (int)JInt(a, "in_flight");
                         ai.uid = uid;
                         patch.accounts.push_back(std::move(ai));
@@ -322,6 +358,7 @@ void Worker::PollOnce()
             sn.total = patch.total; sn.healthy = patch.healthy;
             sn.servable_cn = patch.servable_cn; sn.servable_global = patch.servable_global;
             sn.cooling = patch.cooling; sn.disabled_n = patch.disabled_n; sn.sticky = patch.sticky;
+            sn.in_flight_full = patch.in_flight_full;
             if (patch.accounts_valid) { sn.accounts = std::move(patch.accounts); sn.accounts_valid = true; }
             sn.last_ok_ts = (int64_t)time(nullptr);
         }
@@ -343,12 +380,18 @@ void Worker::PollOnce()
         relaunch_ts_.clear();
     }
 
-    // —— 实时积分自动刷新（默认关；开着则严格按服务端冷却节奏） ——
-    if (s.credits_refresh_interval_min > 0 && sn.admin_available && NowSec() >= (int64_t)next_auto_credit_ / 1000) {
-        if (sn.credits.cooldown_until <= NowSec() && !IsActionBusy("credits")) {
-            RequestRefreshCredits();
+    // —— 实时积分自动刷新（默认关；开着则严格贴服务端冷却节奏） ——
+    // 节奏以服务端实际冷却为准：next_auto_credit_ 只做"别空转"的闸，
+    // 冷却没过就每 5 秒重查 cooldown_until，一到点立刻补查——即使本函数
+    // 很少被走到（冷却 >> 轮询周期），准点性也由这里兜住。
+    if (s.credits_refresh_interval_min > 0 && sn.admin_available && !IsActionBusy("credits")) {
+        int64_t nowx = NowSec();
+        if (sn.credits.cooldown_until <= nowx) {
+            if (nowx >= (int64_t)next_auto_credit_ / 1000) {
+                RequestRefreshCredits();
+                next_auto_credit_ = (ULONGLONG)(nowx + 5) * 1000; // 5 秒后仍未过闸再试
+            }
         }
-        next_auto_credit_ = (ULONGLONG)(NowSec() + s.credits_refresh_interval_min * 60) * 1000;
     }
 }
 
@@ -519,9 +562,14 @@ void Worker::BuildDisplayLocked()
     if (sn.pid) head += WideFormat(L"（PID %lu）", sn.pid);
     lines.push_back(head);
     lines.push_back(WideFormat(L"地址：http://127.0.0.1:%d", st.port));
-    if (StateIsOn(sn.state))
-        lines.push_back(WideFormat(L"健康 %d/%d · 冷却 %d · 禁用 %d · 粘性会话 %d",
-            sn.healthy, sn.total, sn.cooling, sn.disabled_n, sn.sticky));
+    if (StateIsOn(sn.state)) {
+        std::wstring cnt = WideFormat(L"健康 %d/%d · 冷却 %d · 禁用 %d · 粘性会话 %d",
+            sn.healthy, sn.total, sn.cooling, sn.disabled_n, sn.sticky);
+        // 满载只在出现时占一行字：绿点但 chat 503 的元凶就是它（ServableNow 排除占满号）。
+        if (sn.in_flight_full > 0)
+            cnt += WideFormat(L" · 在途满载 %d", sn.in_flight_full);
+        lines.push_back(cnt);
+    }
     if (!sn.last_error.empty()) lines.push_back(L"提示：" + sn.last_error);
 
     if (StateIsOn(sn.state) && sn.accounts_valid && !sn.accounts.empty()) {
@@ -897,6 +945,42 @@ bool Worker::RequestRefreshCredits()
         RefreshSoon();
     }).detach();
     return true;
+}
+
+// 把自动刷新周期同步到服务端冷却（保存按钮的阻塞路径，仅 UI 线程调用）。
+// 首选 PATCH /admin/credits-interval（热生效+写回服务 config.json）；404 时把
+// 旧版 wb2api 的现状原样告诉调用方，由 UI 决定怎么提示。
+std::wstring Worker::SyncCreditsIntervalBlocking(int minutes)
+{
+    // 0=关闭自动刷新：插件侧不会再自动查询，服务端冷却维持原状即可。
+    // 服务端区间是 60–86400 秒，下发 0 必吃 400——关档不该弹"服务端拒绝"的假告警。
+    if (minutes <= 0) return L"";
+    Settings s = SettingsStore::Instance().Get();
+    std::string bearer = SettingsStore::Instance().CurrentApiKey();
+    std::wstring base = WideFormat(L"http://127.0.0.1:%d", s.port);
+    json body{ { "interval_sec", minutes * 60 } };
+    // 5 秒：loopback 小请求的宽裕上限；设 0（关闭）时也应快速返回
+    HttpResponse r = HttpJson(L"PATCH", base + L"/admin/credits-interval", bearer, body.dump(), 5000);
+    if (r.status == 200) {
+        json j; try { j = json::parse(r.body); } catch (...) {}
+        int64_t applied = JInt(j, "interval_sec", -1);
+        // 自愈：读回服务端实收值，分钟粒度取整的偏差（<1 分钟）直接接受
+        if (applied >= 0 && std::llabs(applied - (int64_t)minutes * 60) >= 60) {
+            return WideFormat(L"服务端实收间隔 %lld 秒与请求 %d 分钟不一致", applied, minutes);
+        }
+        return L"";
+    }
+    if (r.status == 404) return L"wb2api 版本过旧，无 /admin/credits-interval 接口（升级服务后重试）";
+    if (r.status == 400) {
+        json j; try { j = json::parse(r.body); } catch (...) {}
+        // 服务端错误走 OpenAI 风格：{"error":{"message":...}}
+        std::wstring msg;
+        if (j.contains("error") && j["error"].is_object())
+            msg = Utf8ToWide(JStr(j["error"], "message"));
+        return msg.empty() ? L"服务端拒绝该间隔（400）" : msg;
+    }
+    if (r.status == 401) return L"api_key 不符（401）";
+    return r.err.empty() ? WideFormat(L"HTTP %lu", r.status) : r.err;
 }
 
 } // namespace wb2

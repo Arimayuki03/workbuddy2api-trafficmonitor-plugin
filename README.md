@@ -1,6 +1,7 @@
 # TrafficMonitor WorkBuddy2API 插件
-# 本仓库为 TrafficMonitor 制作的 workbuddy2api 服务监控插件（随带官方插件接口头 API v8，1.8.6 实测）。
-# 需配合 https://github.com/Arimayuki03/workbuddy2api（含 /admin 接口的 fork）使用，详见"前置条件"。
+
+本仓库为 TrafficMonitor 制作的 workbuddy2api 服务监控插件（随带官方插件接口头 API v8，1.8.6 实测）。
+需配合 [Arimayuki03/workbuddy2api](https://github.com/Arimayuki03/workbuddy2api)（含 `/admin` 接口的 fork）使用，详见"前置条件"。
 
 ## 组成
 
@@ -15,9 +16,10 @@
 
 ## 前置条件（重要）
 
-**本插件必须配合 https://github.com/Arimayuki03/workbuddy2api 使用**——`/admin` 管理接口
-（任务开关/立即执行/实时积分/积分冷却热改）是该 fork 独有的，官方上游 Sliverkiss/workbuddy2api
-没有这些接口，插件的"定时任务/实时积分"页会提示不可用，只能看服务状态与账户估算积分。
+**本插件必须配合 [Arimayuki03/workbuddy2api](https://github.com/Arimayuki03/workbuddy2api) 使用**
+——`/admin` 管理接口（任务开关/立即执行/实时积分/积分冷却热改）是该 fork 独有的，
+官方上游 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 没有这些接口，
+插件的"定时任务/实时积分"页会提示不可用，只能看服务状态与账户估算积分。
 
 启用完整功能需在 workbuddy2api 的 `config.json` 增加并重启一次服务：
 

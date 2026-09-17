@@ -133,3 +133,7 @@ powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1 -TMDir 'E:\软件\Tr
 - 因此悬浮提示默认**完整展开**（设置 `tooltip_full`，"显示"页可关）。多插件同载再弹参数错误时，
   关闭该选项即回到折叠配额：每行 64 字符 / 4 行 / 总长 150 字符兜底（`worker.cpp` BuildDisplayLocked），
   实测三插件同载不再弹框；其他插件的 tooltip 长度不受本插件控制。
+
+## 许可
+
+本项目基于 [MIT License](LICENSE) 开源。

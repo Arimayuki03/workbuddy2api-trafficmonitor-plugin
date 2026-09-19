@@ -138,14 +138,31 @@ void SettingsStore::Update(const Settings& s)
     std::wstring p;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        copy = cur_ = s;
-        copy.config_dir = cur_.config_dir;
+        copy = s; // 以入参为基底（旧写法 copy = cur_ = s 右结合：cur_ 先被入参污染，config_dir 保护失效）
+        copy.config_dir = cur_.config_dir; // 运行期注入字段以现值为准（入参可能是裸默认结构）
+        cur_ = copy;
         p = path_;
     }
     if (p.empty()) return;
     // 锁外原子落盘；失败只记日志（内存值已生效，下次 Update 重试）
     if (!WriteFileAtomicW(p, SerializeSettings(copy).dump(2)))
         LogE(L"settings: 配置落盘失败");
+}
+
+Settings SettingsStore::Modify(const std::function<void(Settings&)>& fn)
+{
+    Settings copy;
+    std::wstring p;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        fn(cur_);
+        copy = cur_;
+        p = path_;
+    }
+    if (p.empty()) return copy;
+    if (!WriteFileAtomicW(p, SerializeSettings(copy).dump(2)))
+        LogE(L"settings: 配置落盘失败");
+    return copy;
 }
 
 std::string SettingsStore::CurrentApiKey()

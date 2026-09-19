@@ -1,5 +1,6 @@
 // worker.cpp — 轮询状态机 + 动作队列实现。判定原则（都对应真实踩过的坑）：
-//  * 503 且有服务身份 = "活着但没可用账号"，绝不判停止（wb2api 语义）；
+//  * 503 且有服务身份 = "活着但没可用账号"，绝不判停止（wb2api 语义）；其余非 200（404/500…）
+//    是真实故障，走与超时同款防抖降级，不伪装成"暂无可用账号"；
 //  * 超时/无响应 ≠ 停止（保持旧态，连续 5 次才降级 Dead）；只有"连接被拒"类直接判停止；
 //  * 身份校验双保险：X-Service 头 或 body.service —— 二者都不是 workbuddy2api → WrongService；
 //  * 判"停止"前顺手查端口归属：被外来进程占用要显示"被占用"而不是"已停止"。
@@ -13,6 +14,7 @@
 #include <cstdio>
 #include <ctime>
 #include <cmath>
+#include <cstdlib>  // std::llabs（自愈校验用；别依赖 json.hpp 传递包含）
 #include <map>
 
 using json = nlohmann::json;
@@ -132,11 +134,26 @@ void Worker::Start()
 
 void Worker::Stop()
 {
-    if (!started_.load()) return;
+    if (!started_.exchange(false)) return;
     stop_ = true;
     cv_.notify_all();
-    if (th_.joinable()) th_.join();
-    started_ = false;
+    if (!th_.joinable()) return;
+    if (th_.get_id() == std::this_thread::get_id()) {
+        // 延迟卸载路径：DllMain(DETACH) 在轮询线程自身栈上补发，join 自己必死锁。
+        // 只能置位后 detach 离场，让线程跑完收尾。
+        th_.detach();
+        return;
+    }
+    // 有界等待：进程退出时 ExitProcess 已终止线程，句柄即刻有信号（实测 join <1ms）。
+    // 3 秒兜底：万一线程还活着（正卡在一次 HTTP），detach 后其模块引用会继续钉住
+    // 映像，代码页不会失效（已实测）；同时把 started_ 抬回去，防止后续 Start()
+    // 在旧线程未死时叠出第二个轮询线程。
+    if (WaitForSingleObject(th_.native_handle(), 3000) == WAIT_OBJECT_0) {
+        th_.join();
+    } else {
+        started_ = true;
+        th_.detach();
+    }
 }
 
 Snapshot Worker::Copy() const
@@ -244,19 +261,29 @@ void Worker::PollOnce()
         if (id_ok) {
             patch.total = (int)JInt(body, "total");
             patch.healthy = (int)JInt(body, "healthy");
-            if (body.contains("realm_servable") && body["realm_servable"].is_object()) {
-                patch.servable_cn = JBool(body["realm_servable"], "cn");
-                patch.servable_global = JBool(body["realm_servable"], "global");
+            // 非 200 细分：503=wb2api"活着但无可用账号"（Unservable，绝不判停止）；
+            // 其余非 200（404/500/401…）是真实故障，不能一律判成 Unservable 把橙点
+            // 显示成"暂无可用账号"——走与超时同款防抖：保持旧态 + 错误行标状态码，
+            // 连续 5 次自然降级 Dead。
+            if (hr.status == 200) {
+                patch.state = SvcState::Running;
+                consecutive_soft_fail_ = 0;
+            } else if (hr.status == 503) {
+                patch.state = SvcState::Unservable;
+                consecutive_soft_fail_ = 0; // 有应答且身份对=联络成功，打断防抖连败
+            } else {
+                consecutive_soft_fail_++;
+                patch.state = SvcState::Unknown; // 占位，Update 里保持旧态
+                if (consecutive_soft_fail_ >= 5) patch.state = SvcState::Dead;
+                patch.last_error = WideFormat(L"/healthz 返回 HTTP %lu", hr.status);
             }
-            patch.state = hr.status == 200 ? SvcState::Running : SvcState::Unservable;
-            consecutive_soft_fail_ = 0;
         } else {
             patch.state = SvcState::WrongService;
             patch.last_error = L"该端口有 HTTP 服务应答，但不是 workbuddy2api（可能装错目录/端口冲突）";
         }
     } else {
         // 传输层失败 → 归类
-        if (HttpErrIsUnreachable(hr.err)) {
+        if (hr.transport == TransportError::Unreachable) {
             proc::Listener l = proc::FindPortListener(s.port);
             if (!l.found) {
                 patch.state = SvcState::Stopped;
@@ -285,11 +312,9 @@ void Worker::PollOnce()
     if (id_ok) {
         HttpResponse sr = HttpJson(L"GET", base + L"/status", key, "", 4000);
         if (sr.status == 401) {
-            patch.need_key_note = true;
             if (patch.last_error.empty())
                 patch.last_error = L"/status 401：api_key 未配置或不符（在设置页填写，或放好服务目录 config.json）";
         } else if (sr.status == 200) {
-            patch.need_key_note = false;
             json sj;
             try { sj = json::parse(sr.body); } catch (...) {}
             if (sj.is_object()) {
@@ -353,10 +378,8 @@ void Worker::PollOnce()
         if (patch.state != SvcState::Unknown) sn.state = patch.state;
         sn.last_error = patch.last_error;
         sn.pid = patch.pid;
-        sn.need_key_note = patch.need_key_note;
         if (id_ok) {
             sn.total = patch.total; sn.healthy = patch.healthy;
-            sn.servable_cn = patch.servable_cn; sn.servable_global = patch.servable_global;
             sn.cooling = patch.cooling; sn.disabled_n = patch.disabled_n; sn.sticky = patch.sticky;
             sn.in_flight_full = patch.in_flight_full;
             if (patch.accounts_valid) { sn.accounts = std::move(patch.accounts); sn.accounts_valid = true; }
@@ -470,11 +493,19 @@ void Worker::ScanAuthExpiry()
         CloseHandle(h);
         json j;
         try { j = json::parse(raw); } catch (...) { continue; }
+        // 双形态探测（同服务端 internal/auth/auth.go Parse）：嵌套形取
+        // account.uid + auth.expiresAt；扁平形（手写/旧版）取顶层 uid/expiresAt。
+        // 两形态 expiresAt 均为 Unix 秒。
         std::string uid;
-        if (j.contains("account") && j["account"].is_object()) uid = JStr(j["account"], "uid");
-        if (uid.empty()) continue;
         int64_t exp = 0;
-        if (j.contains("auth") && j["auth"].is_object()) exp = JInt(j["auth"], "expiresAt");
+        if (j.contains("auth") && j["auth"].is_object()) {
+            if (j.contains("account") && j["account"].is_object()) uid = JStr(j["account"], "uid");
+            exp = JInt(j["auth"], "expiresAt");
+        } else {
+            uid = JStr(j, "uid");
+            exp = JInt(j, "expiresAt");
+        }
+        if (uid.empty()) continue;
         if (exp > 0) out[uid] = exp;
     } while (FindNextFileW(hf, &find));
     FindClose(hf);
@@ -758,11 +789,8 @@ bool Worker::RequestSetTaskHours(const std::string& kind, const std::vector<int>
 
 void Worker::SetUserStopped(bool v)
 {
-    Settings s = SettingsStore::Instance().Get();
-    if (s.user_stopped != v) {
-        s.user_stopped = v;
-        SettingsStore::Instance().Update(s);
-    }
+    // 原子读-改-写：先 Get 再 Update 的两步写法会与 UI/动作线程并发保存设置互相覆盖。
+    SettingsStore::Instance().Modify([v](Settings& st) { st.user_stopped = v; });
 }
 
 bool Worker::RequestStartService()
@@ -947,40 +975,50 @@ bool Worker::RequestRefreshCredits()
     return true;
 }
 
-// 把自动刷新周期同步到服务端冷却（保存按钮的阻塞路径，仅 UI 线程调用）。
-// 首选 PATCH /admin/credits-interval（热生效+写回服务 config.json）；404 时把
-// 旧版 wb2api 的现状原样告诉调用方，由 UI 决定怎么提示。
-std::wstring Worker::SyncCreditsIntervalBlocking(int minutes)
+// 把自动刷新周期异步同步到服务端冷却（PATCH /admin/credits-interval，动作线程）。
+// 结果经 action_note 回显；0=关闭自动刷新不下发（服务端区间 60–86400 秒，下发 0 必 400）。
+// 不在 UI 线程同步等结果：服务僵死时一次 PATCH 会把设置窗连同宿主消息泵冻结到超时
+// （worker.h 线程模型铁律：UI 线程禁止任何同步网络调用）。
+void Worker::RequestSyncCreditsInterval(int minutes)
 {
     // 0=关闭自动刷新：插件侧不会再自动查询，服务端冷却维持原状即可。
-    // 服务端区间是 60–86400 秒，下发 0 必吃 400——关档不该弹"服务端拒绝"的假告警。
-    if (minutes <= 0) return L"";
-    Settings s = SettingsStore::Instance().Get();
-    std::string bearer = SettingsStore::Instance().CurrentApiKey();
-    std::wstring base = WideFormat(L"http://127.0.0.1:%d", s.port);
-    json body{ { "interval_sec", minutes * 60 } };
-    // 5 秒：loopback 小请求的宽裕上限；设 0（关闭）时也应快速返回
-    HttpResponse r = HttpJson(L"PATCH", base + L"/admin/credits-interval", bearer, body.dump(), 5000);
-    if (r.status == 200) {
-        json j; try { j = json::parse(r.body); } catch (...) {}
-        int64_t applied = JInt(j, "interval_sec", -1);
-        // 自愈：读回服务端实收值，分钟粒度取整的偏差（<1 分钟）直接接受
-        if (applied >= 0 && std::llabs(applied - (int64_t)minutes * 60) >= 60) {
-            return WideFormat(L"服务端实收间隔 %lld 秒与请求 %d 分钟不一致", applied, minutes);
+    if (minutes <= 0) return;
+    const std::string key = "credits_interval";
+    if (!BeginAct(key)) return; // 上一次同步还没回来：丢弃本次（保存路径连点防护）
+    std::thread([this, minutes, key] {
+        Settings s = SettingsStore::Instance().Get();
+        std::string bearer = SettingsStore::Instance().CurrentApiKey();
+        std::wstring base = WideFormat(L"http://127.0.0.1:%d", s.port);
+        json body{ { "interval_sec", minutes * 60 } };
+        // 5 秒：loopback 小请求的宽裕上限
+        HttpResponse r = HttpJson(L"PATCH", base + L"/admin/credits-interval", bearer, body.dump(), 5000);
+        std::wstring note;
+        if (r.status == 200) {
+            json j; try { j = json::parse(r.body); } catch (...) {}
+            // 自愈：读回服务端实收值，分钟粒度取整的偏差（<1 分钟）直接接受
+            int64_t applied = JInt(j, "interval_sec", -1);
+            if (applied >= 0 && std::llabs(applied - (int64_t)minutes * 60) >= 60)
+                note = WideFormat(L"服务端实收间隔 %lld 秒与请求 %d 分钟不一致", applied, minutes);
+            else
+                note = WideFormat(L"自动刷新周期已同步服务端（%d 分钟）", minutes);
+        } else if (r.status == 404) {
+            note = L"wb2api 版本过旧，无 /admin/credits-interval 接口（升级服务后重试）";
+        } else if (r.status == 400) {
+            json j; try { j = json::parse(r.body); } catch (...) {}
+            // 服务端错误走 OpenAI 风格：{"error":{"message":...}}
+            std::wstring msg;
+            if (j.contains("error") && j["error"].is_object())
+                msg = Utf8ToWide(JStr(j["error"], "message"));
+            note = msg.empty() ? L"服务端拒绝该间隔（400）" : msg;
+        } else if (r.status == 401) {
+            note = L"api_key 不符（401）";
+        } else {
+            note = r.err.empty() ? WideFormat(L"同步失败（HTTP %lu）", r.status) : r.err;
         }
-        return L"";
-    }
-    if (r.status == 404) return L"wb2api 版本过旧，无 /admin/credits-interval 接口（升级服务后重试）";
-    if (r.status == 400) {
-        json j; try { j = json::parse(r.body); } catch (...) {}
-        // 服务端错误走 OpenAI 风格：{"error":{"message":...}}
-        std::wstring msg;
-        if (j.contains("error") && j["error"].is_object())
-            msg = Utf8ToWide(JStr(j["error"], "message"));
-        return msg.empty() ? L"服务端拒绝该间隔（400）" : msg;
-    }
-    if (r.status == 401) return L"api_key 不符（401）";
-    return r.err.empty() ? WideFormat(L"HTTP %lu", r.status) : r.err;
+        Update([&](Snapshot& sn) { NoteLocked(sn, note); });
+        EndAct(key);
+        RefreshSoon();
+    }).detach();
 }
 
 } // namespace wb2

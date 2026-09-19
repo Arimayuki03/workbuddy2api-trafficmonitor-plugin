@@ -41,10 +41,15 @@ powershell -ExecutionPolicy Bypass -File build\build.ps1
 powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1 -TMDir 'E:\软件\TrafficMonitor'
 ```
 
-重启 TrafficMonitor（或在插件管理里重载），插件管理列表中会出现 **WorkBuddy2API**。
+重启 TrafficMonitor（首次安装也可在插件管理里"重新加载"让宿主发现新 DLL），插件管理列表中会出现
+**WorkBuddy2API**。
 在"显示项目"里勾选 `WB2API 服务状态` 即出现在主窗口/任务栏窗口。
 **栏位不显示时先查这里**：主窗口与任务栏窗口各有独立的显示项勾选（落盘在 TM 目录 config.ini 的
 `plugin_display_item` 列表），插件加载正常 ≠ 已勾选显示。
+
+**更新插件后必须重启 TrafficMonitor**：`deploy.ps1` 已用"改名式替换"（旧 DLL 先改名挪走再拷入
+新文件），TM 运行中也能落位新 DLL；但「插件管理→重新加载」**不会**真正加载新代码——worker
+轮询线程持有模块引用把已加载的 DLL 钉在进程里，重载后跑的仍是旧实例（不报错不崩溃），只有重启宿主才生效。
 
 ## 使用
 
@@ -117,6 +122,12 @@ powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1 -TMDir 'E:\软件\Tr
 ## 已知边界
 
 - 只监控/控制 **本机回环**上的 wb2api（`/admin` 拒绝非 loopback 来源）。
+- 插件更新后「插件管理→重新加载」**不会**加载新代码（worker 线程钉住 DLL 映像，重载静默失效），
+  改配置/换 DLL 后请**重启 TM**；部署脚本已做改名式替换，见"部署"一节。
+- 诊断开关：设环境变量 `WB2API_TRACE=1` 后启动 TM，插件会记录接口调用时序，并把 first-chance
+  异常（C++ 异常含调用栈）写入追踪日志：默认 `<WB2API_TRACE_DIR>\wb2api_trace.log`（未设该变量
+  则为 TM 当前目录），也可用 `WB2API_TRACE_PATH` 直接指定完整文件路径。普通 Release 产物即支持
+  （运行期开关，无需专用构建），未开启时零开销；排查"遇到不适当的参数"等宿主弹框时使用。
 - "停止服务"只会动 **路径与设置一致** 的 `wb2api.exe`；端口被别的程序占用时明确报错而不误杀。
 - 定时任务勾选的写回会先备份 `config.json.bak`，并只改动目标一行（未知字段/键序保留）。
 - 服务运行中修改 `schedule` 小时段仍需重启；只有 `*_enabled` 开关与积分冷却

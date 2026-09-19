@@ -23,7 +23,7 @@ public:
     static Worker& Instance();
 
     void Start();                    // OnInitialize 调；幂等
-    void Stop();                     // DLL_PROCESS_DETACH：停线程、join
+    void Stop();                     // DLL_PROCESS_DETACH：置位停止→有界等待→超时 detach 兜底（不能裸 join：见实现注释）
     bool Started() const { return started_.load(); }
 
     Snapshot Copy() const;
@@ -40,11 +40,10 @@ public:
     bool RequestSetTaskHours(const std::string& kind, const std::vector<int>& hours); // 写回服务 config.json（重启生效）
     bool RequestRefreshCredits();
     bool IsActionBusy(const std::string& key) const;         // "svc"/"credits"/"task:<kind>"
-    // 把实时积分自动刷新周期同步到服务端冷却（PATCH /admin/credits-interval，
-    // 热生效+写回服务 config.json；服务端区间 60–86400 秒）。minutes<=0（关闭自动
-    // 刷新）不下发、直接返回成功。阻塞调用（保存按钮路径，UI 线程专用）；
-    // 返回空串=成功，非空=中文错误。
-    std::wstring SyncCreditsIntervalBlocking(int minutes);
+    // 把实时积分自动刷新周期异步同步到服务端冷却（PATCH /admin/credits-interval，
+    // 热生效+写回服务 config.json；服务端区间 60–86400 秒）。动作线程内执行，结果经
+    // action_note 回显；minutes<=0（关闭自动刷新）不下发直接返回。
+    void RequestSyncCreditsInterval(int minutes);
 
     void RefreshSoon();              // 请求下一循环立即跑（动作完成后调用）
 

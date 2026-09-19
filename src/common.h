@@ -4,8 +4,13 @@
 // 各自边界处显式转换，绝不经过 ANSI 代码页。
 #pragma once
 
+// 构建脚本已全局定义同名宏，加 ifndef 防 C4005 双定义告警
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <string>
 #include <vector>

@@ -3,6 +3,7 @@
 #pragma once
 #include <string>
 #include <mutex>
+#include <functional>
 #include <windows.h>
 
 namespace wb2 {
@@ -40,6 +41,10 @@ public:
     Settings Get() const;
     // 保存：锁内替换 + 锁外原子落盘（tmp+rename）。
     void Update(const Settings& s);
+    // 原子读-改-写：fn 在锁内直接改当前值，锁外原子落盘，返回改后副本。
+    // 用于"只动一两个字段"的并发场景（动作线程/菜单线程 vs 设置窗保存），
+    // 替代 Get→改→Update 的竞态窗口。fn 内不得调用 SettingsStore 的任何方法（死锁）。
+    Settings Modify(const std::function<void(Settings&)>& fn);
 
     // api_key：读 service_dir\config.json 的 api_key（mtime 缓存，静默失败返回空）。
     // 可能从 worker/action/UI 线程调用，内部自锁。返回 UTF-8。

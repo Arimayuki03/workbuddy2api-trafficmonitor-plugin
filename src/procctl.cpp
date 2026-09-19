@@ -108,6 +108,7 @@ bool StartService(std::wstring& err)
     if (!ServiceFilesOk(err)) return false;
     Settings s = SettingsStore::Instance().Get();
     Listener l = FindPortListener(s.port);
+    bool created = false; // 本次调用是否真正创建了进程（healthz 超时文案据此区分口径）
     if (l.found) {
         if (l.is_our_service) {
             // 已在跑（可能还没就绪）：交给下方就绪等待
@@ -138,9 +139,14 @@ bool StartService(std::wstring& err)
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
         LogI(L"start: 进程已创建，等待就绪");
+        created = true;
     }
     if (!WaitHealthzReady(15000)) {
-        err = L"进程已启动，但 15 秒内 /healthz 未就绪（查看服务目录 logs\\server.log）";
+        // 走"端口已被自家服务占用"分支时根本没有创建进程：超时多半是原本就占着端口的
+        // （可能僵死的）服务没就绪，与"新拉起的进程没就绪"分开表述，避免误导排查方向。
+        err = created
+            ? L"进程已创建，但 15 秒内 /healthz 未就绪（查看服务目录 logs\\server.log）"
+            : L"端口上的 wb2api 15 秒内未就绪（疑似已有僵死进程，可尝试重启服务；查看服务目录 logs\\server.log）";
         return false;
     }
     return true;

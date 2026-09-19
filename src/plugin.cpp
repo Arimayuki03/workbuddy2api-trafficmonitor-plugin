@@ -12,7 +12,6 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
-#include <algorithm>
 
 namespace wb2 {
 
@@ -46,7 +45,7 @@ const wchar_t* CPluginApp::GetInfo(PluginInfoIndex index)
     case TMI_DESCRIPTION: return L"workbuddy2api 服务状态监控与手动控制（loopback 本地接口）";
     case TMI_AUTHOR: return L"Arima";
     case TMI_COPYRIGHT: return L"MIT License";
-    case TMI_VERSION: return L"1.2.0";
+    case TMI_VERSION: return L"1.3.0";
     case TMI_URL: return L"https://github.com/Arimayuki03/workbuddy2api-trafficmonitor-plugin";
     default: return L"";
     }
@@ -171,19 +170,20 @@ int CPluginApp::GetCommandCount() { WB2API_TRACE_LOG("GetCommandCount"); return 
 const wchar_t* CPluginApp::GetCommandName(int command_index)
 {
     WB2API_TRACE_LOG("GetCommandName");
-    static thread_local std::wstring buf;
-    const wchar_t* names[5] = { L"启动服务", L"停止服务", L"重启服务", L"打开设置…", L"查询实时积分" };
-    if (command_index >= 0 && command_index < 5) return names[command_index];
-    if (command_index >= 5 && command_index < 11) {
-        buf = std::wstring(L"立即执行: ") + kKindZh[command_index - 5];
-        return buf.c_str();
-    }
-    if (command_index >= 11 && command_index < 17) {
-        buf = std::wstring(L"启用: ") + kKindZh[command_index - 11];
-        return buf.c_str();
-    }
-    if (command_index >= 17 && command_index < 20) return kSettingZh[SettingIndex(command_index)];
-    return L"";
+    // 返回长期稳定指针：接口对生命周期无契约，宿主可能"先枚举全部、后渲染"，
+    // 复用 thread_local 缓冲会让前一条命令名失效。
+    static const std::vector<std::wstring> kNames = [] {
+        std::vector<std::wstring> v;
+        v.reserve(20);
+        for (const wchar_t* n : { L"启动服务", L"停止服务", L"重启服务", L"打开设置…", L"查询实时积分" })
+            v.push_back(n);
+        for (int i = 0; i < 6; i++) v.push_back(std::wstring(L"立即执行: ") + kKindZh[i]);
+        for (int i = 0; i < 6; i++) v.push_back(std::wstring(L"启用: ") + kKindZh[i]);
+        for (int i = 0; i < 3; i++) v.push_back(kSettingZh[i]);
+        return v;
+    }();
+    if (command_index < 0 || command_index >= static_cast<int>(kNames.size())) return L"";
+    return kNames[command_index].c_str();
 }
 
 int CPluginApp::IsCommandChecked(int command_index)
@@ -230,31 +230,32 @@ void CPluginApp::OnPluginCommand(int command_index, void* hWnd, void*)
     }
     else if (command_index >= 17 && command_index < 20) {
         int si = SettingIndex(command_index);
-        Settings s = SettingsStore::Instance().Get();
         if (si == 0) {
-            s.autostart_task = !s.autostart_task;
             // 安装/卸载要走 schtasks（~百毫秒），放后台线程别卡菜单关闭
-            bool want = s.autostart_task;
+            Settings cur = SettingsStore::Instance().Get();
+            bool want = !cur.autostart_task; // 勾选切换：目标状态取反
             std::thread([want] {
-                Settings cur = SettingsStore::Instance().Get();
+                std::wstring err;
                 if (want) {
-                    std::wstring err;
                     bool ok = autostart::Install(err);
-                    cur.autostart_task = ok;
                     if (!ok) LogW(L"autostart install: " + err);
+                    // 只回写 autostart_task 一个字段：整结构体回写会覆盖其他线程的并发修改
+                    SettingsStore::Instance().Modify([ok](Settings& st) { st.autostart_task = ok; });
                 } else {
-                    std::wstring err;
                     autostart::Uninstall(err); // 删除失败也取消勾选（下次重开任务页可见真实状态）
-                    cur.autostart_task = false;
+                    SettingsStore::Instance().Modify([](Settings& st) { st.autostart_task = false; });
                 }
-                SettingsStore::Instance().Update(cur);
             }).detach();
             return;
         }
-        if (si == 1) s.start_with_tm = !s.start_with_tm;
-        if (si == 2) s.auto_relaunch = !s.auto_relaunch;
-        SettingsStore::Instance().Update(s);
-        if (si == 1 && s.start_with_tm) wk.RequestStartService();
+        if (si == 1) {
+            Settings after = SettingsStore::Instance().Modify(
+                [](Settings& st) { st.start_with_tm = !st.start_with_tm; });
+            if (after.start_with_tm) wk.RequestStartService();
+        } else if (si == 2) {
+            SettingsStore::Instance().Modify(
+                [](Settings& st) { st.auto_relaunch = !st.auto_relaunch; });
+        }
     }
 }
 
@@ -319,7 +320,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         if (wb2::trace::Active()) // 仅诊断构建/显式开启时注册，避免给宿主加全局异常钩子
             AddVectoredExceptionHandler(1, VectoredExcept);
     } else if (reason == DLL_PROCESS_DETACH) {
-        wb2::Worker::Instance().Stop(); // TM 卸载/退出前停线程（join 有超时上限，不会卡死）
+        wb2::Worker::Instance().Stop(); // TM 卸载/退出前停线程（Worker::Stop 内部做有界等待，超时 detach 兜底，不卡 DllMain）
     }
     return TRUE;
 }

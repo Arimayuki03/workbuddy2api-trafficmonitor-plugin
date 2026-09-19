@@ -19,6 +19,14 @@ StatusItem& StatusItem::Instance()
     return inst;
 }
 
+// 单例析构：FontFor 的重建路径只 DeleteObject 被替换掉的旧句柄，最后一份缓存的 font_
+// 无人释放（DLL 卸载时会泄漏一个 HFONT），由这里兜底。
+StatusItem::~StatusItem()
+{
+    std::lock_guard<std::mutex> lk(font_mu_);
+    if (font_) DeleteObject(font_);
+}
+
 const wchar_t* StatusItem::GetItemName() const { return L"WB2API 服务状态"; }
 const wchar_t* StatusItem::GetItemId() const { return L"WB2API_STATUS"; }
 const wchar_t* StatusItem::GetItemLableText() const { return L"WB2API"; }

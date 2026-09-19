@@ -24,6 +24,7 @@ public:
 
 private:
     StatusItem() = default;
+    ~StatusItem();  // 释放缓存的字体句柄（FontFor 重建路径只回收被替换的旧句柄，最后一份在这里还）
     // 字体克隆宿主 DC 当前字体（缓存句柄，(高,字重,字面) 变了才重建；随 TM 生命周期释放）
     HFONT FontFor(HDC dc) const;
     mutable std::mutex font_mu_;

@@ -14,14 +14,14 @@ $cfg = if ($env:CFG) { $env:CFG } else { 'Release' }
 $out = Join-Path $root "build\out\$cfg"
 New-Item -ItemType Directory -Force -Path $out | Out-Null
 
-$srcs = @('common','logger','settings','http','procctl','autostart','worker','item','plugin','dialogs','trace') |
-    ForEach-Object { Join-Path $root "src\$_.cpp" }
-$srcList = $srcs -join ' '
+# 模块表只在这里维护一份：$srcList 与 $objs 都从 $mods 派生（此前两处各硬编码一份，
+# 新增/改名模块时改一漏一就会编译或链接失败），参照 build_trace.ps1 的单份范式。
+$mods = @('common','logger','settings','http','procctl','autostart','worker','item','plugin','dialogs','trace')
+$srcList = ($mods | ForEach-Object { Join-Path $root "src\$_.cpp" }) -join ' '
+$objs = ($mods | ForEach-Object { "$_.obj" }) -join ' '
 
 $cppFlags = "/nologo /std:c++17 /EHsc /W3 /utf-8 /DNDEBUG /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /O2 /MT /I`"$root\include`" /I`"$root\third_party`" /I`"$root\res`""
 $rcFlags  = "/nologo /DUNICODE /D_UNICODE /fo plugin.res /I`"$root\res`" /I`"$root\include`""
-$objs = (@('common','logger','settings','http','procctl','autostart','worker','item','plugin','dialogs','trace') |
-    ForEach-Object { "$_.obj" }) -join ' '
 
 $lines = @(
     '@echo off',

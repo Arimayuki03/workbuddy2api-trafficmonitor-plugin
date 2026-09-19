@@ -658,18 +658,10 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
                 MessageBoxW(hDlg, bad.c_str(), L"设置未保存", MB_OK | MB_ICONWARNING);
                 return TRUE;
             }
-            // 积分自动刷新周期先于落盘同步到服务端：改失败只提示不阻断保存
-            // （服务端可能未升级/未开 admin），插件侧仍按本地值尽力而为。
-            if (c.work.credits_refresh_interval_min != c.orig.credits_refresh_interval_min) {
-                SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-                std::wstring sync_err = Worker::Instance().SyncCreditsIntervalBlocking(
-                    c.work.credits_refresh_interval_min);
-                if (!sync_err.empty()) {
-                    MessageBoxW(hDlg, (L"周期已保存到插件，但同步服务端失败：\n" + sync_err +
-                        L"\n\n服务端仍按其 config.json 里的冷却执行；升级 wb2api 后重试。").c_str(),
-                        L"服务端冷却同步失败", MB_OK | MB_ICONWARNING);
-                }
-            }
+            // 积分自动刷新周期变化即后台同步到服务端（动作线程 PATCH，不阻塞 UI）；
+            // 结果经 action_note 回显（tooltip 与设置页页脚），失败不阻断保存。
+            if (c.work.credits_refresh_interval_min != c.orig.credits_refresh_interval_min)
+                Worker::Instance().RequestSyncCreditsInterval(c.work.credits_refresh_interval_min);
             if (c.work.autostart_task != c.orig.autostart_task) {
                 SetCursor(LoadCursorW(nullptr, IDC_WAIT));
                 if (c.work.autostart_task) {

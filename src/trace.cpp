@@ -65,7 +65,8 @@ void Init()
 
 void Write(const char* what)
 {
-    if (!g_file) return;
+    // 不在锁外裸读 g_file（与 Init 的写构成数据竞争）；持锁后用 EnabledUnlocked() 判断，
+    // 与 ExceptRecord/StackRecord 的写法一致。
     std::lock_guard<std::mutex> lk(g_mu);
     if (!EnabledUnlocked()) return;
     unsigned long long t = GetTickCount64();

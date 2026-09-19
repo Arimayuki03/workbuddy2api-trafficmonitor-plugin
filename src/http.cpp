@@ -1,7 +1,8 @@
-// http.cpp — WinHTTP 实现。错误文案区分三类，状态机按类别决定 保持旧态/判停/判异常：
-//   - 拒绝连接/网络不可达 → "服务不在"（可判 STOPPED）
-//   - 超时 → "慢/无响应"（保持旧态，防抖）
-//   - 其他（DNS、代理等）→ 异常（保持旧态）
+// http.cpp — WinHTTP 实现。传输层失败按 TransportError 枚举分类（不再用中文文案做控制流），
+// 状态机按类别决定 保持旧态/判停/判异常：
+//   - 拒绝连接/网络不可达 → Unreachable（"服务不在"，可判 STOPPED）
+//   - 超时 → Timeout（"慢/无响应"，保持旧态防抖）
+//   - 其他（DNS、URL 非法、代理等）→ Other（保持旧态）
 #include "http.h"
 #include "common.h"
 #include <winhttp.h>
@@ -21,6 +22,20 @@ const wchar_t* WinHttpErrText(DWORD code)
     case ERROR_WINHTTP_NAME_NOT_RESOLVED:  return L"地址解析失败";
     case ERROR_WINHTTP_INVALID_SERVER_RESPONSE: return L"响应格式异常";
     default: return nullptr;
+    }
+}
+
+// WinHTTP 错误码 → 传输失败分类。与旧版文案分类逐一等价：
+// 超时 → Timeout；CANNOT_CONNECT / CONNECTION_ERROR / INTERNAL_ERROR（旧文案"连接被拒绝"）→
+// Unreachable；其余（DNS、响应异常等）→ Other。
+TransportError Classify(DWORD code)
+{
+    switch (code) {
+    case ERROR_WINHTTP_TIMEOUT:             return TransportError::Timeout;
+    case ERROR_WINHTTP_CANNOT_CONNECT:
+    case ERROR_WINHTTP_CONNECTION_ERROR:
+    case ERROR_WINHTTP_INTERNAL_ERROR:      return TransportError::Unreachable;
+    default:                                return TransportError::Other;
     }
 }
 
@@ -48,17 +63,19 @@ HttpResponse HttpJson(LPCWSTR method, const std::wstring& url,
     uc.lpszExtraInfo = extra; uc.dwExtraInfoLength = 127;
     if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) {
         out.err = L"URL 解析失败";
+        out.transport = TransportError::Other;
         return out;
     }
 
     HINTERNET session = WinHttpOpen(L"WorkBuddy2ApiTMPlugin/1.0",
         WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session) { out.err = L"WinHTTP 初始化失败"; return out; }
+    if (!session) { out.err = L"WinHTTP 初始化失败"; out.transport = TransportError::Other; return out; }
     WinHttpSetTimeouts(session, 2000, 2000, static_cast<int>(timeout_ms), static_cast<int>(timeout_ms));
 
     HINTERNET conn = WinHttpConnect(session, host, uc.nPort, 0);
     if (!conn) {
         out.err = L"无法建立连接";
+        out.transport = TransportError::Unreachable;  // 连不上本机端口 ≈ 服务不在（旧文案即归此类）
         WinHttpCloseHandle(session);
         return out;
     }
@@ -68,6 +85,7 @@ HttpResponse HttpJson(LPCWSTR method, const std::wstring& url,
         nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!req) {
         out.err = L"无法创建请求";
+        out.transport = TransportError::Other;
         WinHttpCloseHandle(conn); WinHttpCloseHandle(session);
         return out;
     }
@@ -92,8 +110,9 @@ HttpResponse HttpJson(LPCWSTR method, const std::wstring& url,
         we = GetLastError();
         std::wstring text = WinHttpErrText(we) ? WinHttpErrText(we) : WideFormat(L"网络错误 %lu", we);
         out.err = text + L" <- " + method + L" " + url;
-        // 记录"拒绝连接"类供状态机判定：err 前缀即语义（中文文案被 UI 直接使用）。
+        // 分类供状态机判定（与文案解耦，改文案不再影响分类）；err 文案仍由 UI 直接展示。
         out.status = 0;
+        out.transport = Classify(we);
         WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session);
         return out;
     }
@@ -118,12 +137,6 @@ HttpResponse HttpJson(LPCWSTR method, const std::wstring& url,
 
     WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(session);
     return out;
-}
-
-bool HttpErrIsUnreachable(const std::wstring& err)
-{
-    return err.find(L"连接被拒绝") != std::wstring::npos ||
-        err.find(L"无法建立连接") != std::wstring::npos;
 }
 
 } // namespace wb2

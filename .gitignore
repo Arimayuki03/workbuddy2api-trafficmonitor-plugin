@@ -19,3 +19,9 @@ wb2_*.log
 shot_cfg/
 dlg_cfg/
 test_cfg/
+# 调试脚手架（本地保留，不入库）
+build/cost_shot.cpp
+build/dialog_shot.cpp
+build/dialog_shot.rc
+build/test_harness.cpp
+build/test_harness_run.bat

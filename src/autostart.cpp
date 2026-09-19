@@ -137,8 +137,8 @@ bool Uninstall(std::wstring& err)
 {
     std::wstring out;
     LONG code = RunHidden(L"schtasks /Delete /F /TN \"" + std::wstring(TaskName()) + L"\"", out);
-    if (code != 0 && out.find(L"找不到") == std::wstring::npos &&
-        out.find(L"ERROR") == std::wstring::npos && out.find(L"cannot find") == std::wstring::npos) {
+    if (code != 0 && IsInstalled()) {
+        // 退出码非 0 且复查任务仍在才算失败；"任务本就不存在"在任意 locale 下都不再靠文案猜
         err = L"schtasks 删除失败：" + TrimW(out);
         return false;
     }

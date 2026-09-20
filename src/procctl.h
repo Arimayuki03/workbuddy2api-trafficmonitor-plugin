@@ -2,6 +2,7 @@
 // 铁律：只允许操作"路径与设置里 service_dir 一致"的 wb2api.exe——防杀错进程。
 #pragma once
 #include <string>
+#include <atomic>
 #include <windows.h>
 
 namespace wb2::proc {
@@ -22,10 +23,11 @@ bool ServiceFilesOk(std::wstring& err);
 
 // 启动服务：CreateProcessW(CREATE_NO_WINDOW, CWD=service_dir)。
 // 端口已被自家服务占用 → 视为已启动只等就绪；被外来进程占用 → 报错不动它。
-bool StartService(std::wstring& err);
+// cancel（可空）：卸载/退出取消标志，阻塞循环里轮询，置位后尽快返回 false。
+bool StartService(std::wstring& err, const std::atomic<bool>* cancel = nullptr);
 // 优雅停止：/admin/shutdown（若可用）→ 3 秒内等端口释放 → 兜底 TerminateProcess。
-bool StopService(std::wstring& err);
+bool StopService(std::wstring& err, const std::atomic<bool>* cancel = nullptr);
 // /healthz 出 JSON（200 或 503 均算就绪——503 只是没可用账号）。
-bool WaitHealthzReady(int timeout_ms);
+bool WaitHealthzReady(int timeout_ms, const std::atomic<bool>* cancel = nullptr);
 
 } // namespace wb2::proc

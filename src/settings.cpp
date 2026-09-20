@@ -58,7 +58,9 @@ Settings ParseSettings(const json& j)
     if (s.poll_interval_sec < 10) s.poll_interval_sec = 30;
     if (s.poll_interval_sec > 600) s.poll_interval_sec = 600;
     if (s.admin_poll_sec < 15) s.admin_poll_sec = 60;
-    if (s.credits_refresh_interval_min != 0 && s.credits_refresh_interval_min < 1)
+    if (s.credits_refresh_interval_min < 0)
+        s.credits_refresh_interval_min = 0; // 负值=关：钳到 0，不意外打开自动查询（审查修复）
+    else if (s.credits_refresh_interval_min != 0 && s.credits_refresh_interval_min < 1)
         s.credits_refresh_interval_min = 1; // 下限 1 分钟（服务端冷却兜底防风控）
     if (s.credits_refresh_interval_min > 1440) s.credits_refresh_interval_min = 1440;
     if (s.show_mode < 0 || s.show_mode > 2) s.show_mode = SM_STATE_ACCOUNT;

@@ -82,7 +82,8 @@ struct Ctx {
     COLORREF state_color = RGB(120, 120, 120);
     // 页②
     HWND acc_list = nullptr, btn_cred = nullptr, lbl_cool = nullptr, citv_edt = nullptr;
-    int64_t acc_sig = -1;
+    std::wstring acc_hash; // 账户行内容哈希：只有行内容变了才重建列表（旧 sig 含 last_ok_ts，
+                           // 每个轮询周期必变，会周期性重置用户正在浏览的滚动位置/选中行）
     // 页③
     TaskRow task[KIND_N];
     HWND task_warn = nullptr, btn_runall = nullptr, task_note = nullptr;
@@ -357,9 +358,23 @@ void Refresh(Ctx& c)
             sn.credits.total_used >= 0 ? FormatThousands(sn.credits.total_used).c_str() : L"-");
     else cool = L"尚未查询 · 按钮会逐号向服务端发起实时余额查询";
     SetWindowTextW(c.lbl_cool, cool.c_str());
-    int64_t sig = sn.last_ok_ts * 131 + sn.credits.ts * 7 + static_cast<int64_t>(sn.accounts.size());
-    if (on && sn.accounts_valid && sig != c.acc_sig) {
-        c.acc_sig = sig;
+    // 行内容哈希：纳入决定每一行显示内容的字段（uid/昵称/域/估算/实时列/状态/令牌）。
+    // 不含 last_ok_ts/credits.ts 这类"每次轮询必变"的时间戳——列表只在内容真变时重建。
+    std::wstring hash_in;
+    for (auto& a : sn.accounts) {
+        hash_in += a.uid8 + L"|" + a.nickname + L"|" + a.realm + L"|" +
+            std::to_wstring(a.credits) + L"|" + std::to_wstring(a.in_flight) + L"|" +
+            std::to_wstring(a.until) + L"|" + std::to_wstring(a.breaker_until) + L"|" +
+            std::to_wstring(a.degrade_until) + L"|" + std::to_wstring(a.consec_fails) + L"|" +
+            std::to_wstring(a.rl_models) + L"|" + std::to_wstring(a.token_expiry) + L";";
+    }
+    for (auto& r : sn.credits.rows) {
+        hash_in += r.uid8 + L"|" + std::to_wstring(r.remain) + L"|" +
+            std::to_wstring(r.used) + L"|" + std::to_wstring(r.size) + L"|" +
+            (r.ok ? L"1" : L"0") + L";";
+    }
+    if (on && sn.accounts_valid && hash_in != c.acc_hash) {
+        c.acc_hash = hash_in;
         FillAccountList(c, sn);
     }
 
@@ -574,7 +589,9 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         MkBtn(*cp, L"打开服务目录", 112, 46, 80, 14, IDC_BTN_OPENSVC, 4);
         MkBtn(*cp, L"打开服务日志", 196, 46, 80, 14, IDC_BTN_OPENLOG, 4);
         MkBtn(*cp, L"打开插件日志", 280, 46, 80, 14, IDC_BTN_OPENPLOG, 4);
-        MkLabel(*cp, L"WorkBuddy2API TrafficMonitor 插件 v1.2.0 · MIT", 8, 70, 404, 10, 4);
+        MkLabel(*cp, (std::wstring(L"WorkBuddy2API TrafficMonitor 插件 ") +
+            CPluginApp::Instance().GetInfo(ITMPlugin::TMI_VERSION) + L" · MIT").c_str(),
+            8, 70, 404, 10, 4);
         MkHint(*cp, L"https://github.com/Arimayuki03/workbuddy2api-trafficmonitor-plugin", 8, 84, 404, 10, 4);
         MkHint(*cp, L"设计约束：/healthz /status /admin 均为本机回环接口；本插件永不调用 /v1/chat/completions，", 8, 104, 460, 10, 4);
         MkHint(*cp, L"与你的 API 使用互不影响。实时积分查询由服务端冷却与单飞兜底，防止任何路径触发上游风控。", 8, 118, 460, 10, 4);
@@ -679,9 +696,15 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
                 LogInit(c.work.config_dir + L"\\WorkBuddy2ApiPlugin.log", c.work.logging);
             bool changed = !SettingsEqual(c.work, c.orig);
             if (changed) {
-                Settings cur = c.work;
-                cur.user_stopped = c.orig.user_stopped; // 运行期标志不经对话框
-                SettingsStore::Instance().Update(cur);
+                // 运行期标志经 Modify 原子保留：对话框打开期间动作线程（auto-relaunch、
+                // 停止服务）可能改过 user_stopped，用打开时的旧快照覆盖会回滚它。
+                SettingsStore::Instance().Modify([&c](Settings& st) {
+                    std::wstring keep_dir = st.config_dir;
+                    bool keep_stopped = st.user_stopped;
+                    st = c.work;
+                    st.config_dir = keep_dir;
+                    st.user_stopped = keep_stopped;
+                });
                 Worker::Instance().RefreshSoon();
             }
             c.changed_flag = changed;

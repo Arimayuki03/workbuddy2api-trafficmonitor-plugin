@@ -13,8 +13,11 @@ const wchar_t* TaskName() { return L"WorkBuddy2API-Service"; }
 
 namespace {
 
-// 跑隐藏控制台命令并收集输出。返回退出码（-1=没跑起来）。
-LONG RunHidden(const std::wstring& cmd_line, std::wstring& output)
+// 跑隐藏控制台命令并收集输出。返回退出码（-1=没跑起来；-2=cancel 置位中途放弃）。
+// cancel（可空）：等待期间轮询，置位即杀掉子进程返回——宿主卸载时 detached 线程
+// 不能继续在已解映射的模块上逗留（审查 High 项）。
+LONG RunHidden(const std::wstring& cmd_line, std::wstring& output,
+    const std::atomic<bool>* cancel = nullptr)
 {
     output.clear();
     SECURITY_ATTRIBUTES sa{ sizeof sa, nullptr, TRUE };
@@ -38,6 +41,9 @@ LONG RunHidden(const std::wstring& cmd_line, std::wstring& output)
         output = WideFormat(L"命令启动失败 %lu", GetLastError());
         return -1;
     }
+    // 读管道 + 等进程：管道读阻塞时由"子进程已结束 → 读到 EOF"自然退出，
+    // 取消则 TerminateProcess 强杀后 EOF 到来。等待分 200ms 切片轮询 cancel。
+    bool cancelled = false;
     for (;;) {
         char chunk[512];
         DWORD got = 0;
@@ -48,8 +54,19 @@ LONG RunHidden(const std::wstring& cmd_line, std::wstring& output)
             MultiByteToWideChar(CP_OEMCP, 0, chunk, got, piece.data(), wl);
             output += piece;
         }
+        if (cancel && cancel->load()) {
+            cancelled = true;
+            TerminateProcess(pi.hProcess, 1);
+            break;
+        }
     }
     CloseHandle(r);
+    if (cancelled) {
+        WaitForSingleObject(pi.hProcess, 2000);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return -2;
+    }
     WaitForSingleObject(pi.hProcess, 15000);
     DWORD code = 1;
     GetExitCodeProcess(pi.hProcess, &code);
@@ -108,14 +125,14 @@ bool WriteLauncher(std::wstring& err)
 
 } // namespace
 
-bool IsInstalled()
+bool IsInstalled(const std::atomic<bool>* cancel)
 {
     std::wstring out;
-    LONG code = RunHidden(L"schtasks /Query /TN \"" + std::wstring(TaskName()) + L"\" /FO LIST", out);
+    LONG code = RunHidden(L"schtasks /Query /TN \"" + std::wstring(TaskName()) + L"\" /FO LIST", out, cancel);
     return code == 0;
 }
 
-bool Install(std::wstring& err)
+bool Install(std::wstring& err, const std::atomic<bool>* cancel)
 {
     if (!WriteLauncher(err)) return false;
     std::wstring cmd =
@@ -123,7 +140,8 @@ bool Install(std::wstring& err)
         L"\" /SC ONLOGON /RL LIMITED "
         L"/TR \"wscript.exe \\\"" + VbsPath() + L"\\\"\"";
     std::wstring out;
-    LONG code = RunHidden(cmd, out);
+    LONG code = RunHidden(cmd, out, cancel);
+    if (code == -2) return false; // 取消：静默放弃（宿主正在卸载，无需报告）
     if (code != 0) {
         err = L"schtasks 注册失败：" + TrimW(out);
         LogE(L"autostart: " + err);
@@ -133,10 +151,11 @@ bool Install(std::wstring& err)
     return true;
 }
 
-bool Uninstall(std::wstring& err)
+bool Uninstall(std::wstring& err, const std::atomic<bool>* cancel)
 {
     std::wstring out;
-    LONG code = RunHidden(L"schtasks /Delete /F /TN \"" + std::wstring(TaskName()) + L"\"", out);
+    LONG code = RunHidden(L"schtasks /Delete /F /TN \"" + std::wstring(TaskName()) + L"\"", out, cancel);
+    if (code == -2) return false; // 取消：静默放弃
     if (code != 0 && IsInstalled()) {
         // 退出码非 0 且复查任务仍在才算失败；"任务本就不存在"在任意 locale 下都不再靠文案猜
         err = L"schtasks 删除失败：" + TrimW(out);

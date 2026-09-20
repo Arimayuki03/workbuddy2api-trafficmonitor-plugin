@@ -10,7 +10,6 @@
 #include "worker.h"
 #include <cwchar>
 #include <thread>
-#include <chrono>
 #include <algorithm>
 
 namespace wb2 {
@@ -69,9 +68,13 @@ const wchar_t* CPluginApp::GetTooltipInfo()
     short_tip = L"WorkBuddy2API";
     return short_tip.c_str();
 #endif
+    // 乒乓双缓冲：宿主对返回指针无生命周期契约（见 GetCommandName 注释），单缓冲在
+    // 下次调用变长时重分配会让宿主正读着的旧指针悬空。交替写 buf_[0]/[1]，任一次
+    // 返回的指针到"再下一次调用"前不被改写，宿主有整帧时间完成拷贝。
     std::lock_guard<std::mutex> lk(tt_mu_);
-    tt_cache_ = std::move(t);
-    return tt_cache_.c_str();
+    tt_cur_ ^= 1;
+    tt_buf_[tt_cur_] = std::move(t);
+    return tt_buf_[tt_cur_].c_str();
 }
 
 COLORREF CPluginApp::ValueTextColor(bool dark_mode) const
@@ -132,15 +135,9 @@ void CPluginApp::EnsureInited()
             LogInit(s.config_dir + L"\\WorkBuddy2ApiPlugin.log", s.logging);
         Worker::Instance().Start();
         LogI(L"插件初始化完成");
-        if (s.start_with_tm) {
-            std::thread([] {
-                std::this_thread::sleep_for(std::chrono::seconds(2)); // 让 TM/桌面先起
-                if (Worker::Instance().State() == SvcState::Stopped) {
-                    LogI(L"start_with_tm: 拉起服务");
-                    Worker::Instance().RequestStartService();
-                }
-            }).detach();
-        }
+        // start_with_tm 的拉起判定挪进 worker 首轮轮询之后（Worker::MaybeStartWithTm）：
+        // 这里曾派生 sleep(2s) 的裸 detach 线程，宿主快速卸载时它没有取消/等待机制，
+        // 是动作线程卸载竞态（审查 High 项）的来源之一；worker 线程本身受 Stop() 管控。
     });
 }
 
@@ -235,15 +232,21 @@ void CPluginApp::OnPluginCommand(int command_index, void* hWnd, void*)
             Settings cur = SettingsStore::Instance().Get();
             bool want = !cur.autostart_task; // 勾选切换：目标状态取反
             std::thread([want] {
+                // 传入 worker 停止标志：宿主卸载时 schtasks 等待提前终止，
+                // 线程尽快退场，不在已解映射的模块上逗留（审查 High 项）。
+                const std::atomic<bool>* cancel = Worker::Instance().CancelFlag();
                 std::wstring err;
                 if (want) {
-                    bool ok = autostart::Install(err);
-                    if (!ok) LogW(L"autostart install: " + err);
+                    bool ok = autostart::Install(err, cancel);
+                    if (!ok && !Worker::Instance().StopRequested()) LogW(L"autostart install: " + err);
                     // 只回写 autostart_task 一个字段：整结构体回写会覆盖其他线程的并发修改
-                    SettingsStore::Instance().Modify([ok](Settings& st) { st.autostart_task = ok; });
+                    // （取消路径不回写勾选——卸载中设置已无意义）
+                    if (!Worker::Instance().StopRequested())
+                        SettingsStore::Instance().Modify([ok](Settings& st) { st.autostart_task = ok; });
                 } else {
-                    autostart::Uninstall(err); // 删除失败也取消勾选（下次重开任务页可见真实状态）
-                    SettingsStore::Instance().Modify([](Settings& st) { st.autostart_task = false; });
+                    autostart::Uninstall(err, cancel); // 删除失败也取消勾选（下次重开任务页可见真实状态）
+                    if (!Worker::Instance().StopRequested())
+                        SettingsStore::Instance().Modify([](Settings& st) { st.autostart_task = false; });
                 }
             }).detach();
             return;
@@ -301,7 +304,9 @@ static LONG WINAPI VectoredExcept(PEXCEPTION_POINTERS ep)
     char line[160];
     _snprintf_s(line, sizeof line, _TRUNCATE, "except code=%08lX addr=%p mod=%s",
         ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress, mod);
-    wb2::trace::Write(line);
+    // VEH 跑在任何线程的任何 first-chance 异常上：异常若落在另一线程持 trace 锁的
+    // 临界区内，阻塞取锁会自死锁——TryWrite 拿不到就放弃本条（诊断日志允许丢）。
+    wb2::trace::TryWrite(line);
     // C++ 异常（0xE06D7363）：抓调用栈看 throw 点在哪
     if (ep->ExceptionRecord->ExceptionCode == 0xE06D7363) {
         void* frames[24]{};

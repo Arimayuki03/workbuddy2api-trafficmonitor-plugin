@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <memory>
 
 namespace wb2::trace {
 
@@ -77,6 +78,23 @@ void Write(const char* what)
         DWORD written = 0;
         WriteFile(g_file, line, static_cast<DWORD>(n), &written, nullptr);
     }
+}
+
+bool TryWrite(const char* what)
+{
+    // VEH 上下文专用：异常可能落在另一线程持有 g_mu 的临界区内，阻塞 lock() 会自死锁。
+    std::unique_lock<std::mutex> lk(g_mu, std::try_to_lock);
+    if (!lk.owns_lock()) return false;
+    if (!EnabledUnlocked()) return false;
+    unsigned long long t = GetTickCount64();
+    char line[256];
+    int n = snprintf(line, sizeof line, "[%llu.%03llu] #%llu %s\r\n",
+        t / 1000, t % 1000, ++g_seq, what);
+    if (n > 0) {
+        DWORD written = 0;
+        WriteFile(g_file, line, static_cast<DWORD>(n), &written, nullptr);
+    }
+    return true;
 }
 
 void ExceptRecord(const char* where, unsigned long code, void* addr)

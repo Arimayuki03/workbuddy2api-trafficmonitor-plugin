@@ -10,6 +10,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -22,7 +23,7 @@ class Worker {
 public:
     static Worker& Instance();
 
-    void Start();                    // OnInitialize 调；幂等
+    void Start();                    // OnInitialize 调；幂等；会先等上一任超时残留线程退场
     void Stop();                     // DLL_PROCESS_DETACH：置位停止→有界等待→超时 detach 兜底（不能裸 join：见实现注释）
     bool Started() const { return started_.load(); }
 
@@ -45,11 +46,17 @@ public:
     // action_note 回显；minutes<=0（关闭自动刷新）不下发直接返回。
     void RequestSyncCreditsInterval(int minutes);
 
+    // 卸载/退出取消标志（复用轮询线程的 stop_）：动作线程与 procctl/autostart 的阻塞
+    // 循环据此提前退出，防 detached 动作线程在宿主卸载后返回到已解映射的代码页。
+    const std::atomic<bool>* CancelFlag() const { return &stop_; }
+    bool StopRequested() const { return stop_.load(); }
+
     void RefreshSoon();              // 请求下一循环立即跑（动作完成后调用）
 
 private:
     Worker() = default;
-    void RunLoop();
+    void RunLoop(const std::atomic<bool>& run_stop); // run_stop=本轮线程专属停止标志（防超时 detach 的旧线程被新一轮 Start"复活"）
+    void MaybeStartWithTm();         // start_with_tm：首轮轮询后拉起（worker 线程内，不派生裸线程）
     void PollOnce();                 // healthz+status（+防抖状态机+异常拉起）
     void PollAdmin();                // /admin/tasks + /admin/credits（服务端本地缓存，零上游）
     void ScanAuthExpiry();           // 本地 auths\*.json token 到期时间（零上游）
@@ -71,13 +78,18 @@ private:
     std::thread th_;
     std::mutex cv_mu_;
     std::condition_variable cv_;
-    std::atomic<bool> stop_{ false };
+    std::atomic<bool> stop_{ false };        // 动作线程取消标志（CancelFlag）；Start 复位
+    // 轮询线程本轮专属停止标志：Stop 置位后旧线程在当前迭代收尾必退出；每轮 Start 换新。
+    // 专属而非复用 stop_，防"Stop 超时 detach 的旧线程"在新 Start 把 stop_ 复位后复活成双轮询线程。
+    std::shared_ptr<std::atomic<bool>> run_flag_ = std::make_shared<std::atomic<bool>>(false);
+    HANDLE zombie_ = nullptr;                // Stop 超时 detach 的旧线程句柄（下一任 Start 有界等待后关闭）
     std::atomic<bool> started_{ false };
     std::atomic<bool> refresh_flag_{ false };
 
     // 轮询节奏记账（worker 线程私有）
     ULONGLONG next_base_ = 0, next_admin_ = 0, next_auths_ = 0;
     ULONGLONG next_auto_credit_ = 0; // 实时积分自动刷新的下次尝试时间
+    bool start_tm_done_ = false;     // start_with_tm 只试一次（worker 线程私有）
     int consecutive_soft_fail_ = 0;  // 超时类连续失败计数（防抖）
     std::deque<ULONGLONG> relaunch_ts_; // 异常拉起退避窗口
 };

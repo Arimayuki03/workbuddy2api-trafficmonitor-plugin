@@ -129,13 +129,25 @@ void Worker::Start()
     bool expect = false;
     if (!started_.compare_exchange_strong(expect, true)) return;
     stop_ = false;
-    th_ = std::thread([this] { RunLoop(); });
+    // 上一任 Stop 超时 detach 的残留线程：有界等待其退场后关句柄（句柄不关会随每次
+    // 超时累积泄漏）。等不到也照关——句柄只是内核引用，线程对象在其退出时自灭。
+    // 旧线程持有上一代专属 run_flag_（已置位 true，且永不复位），最多跑完当前一次
+    // 轮询就退出；下面换新标志对象，绝不复位旧标志（僵尸若还卡在长 HTTP 里，
+    // 复位会把它"复活"成与新一代并存的第二个常驻轮询线程）。
+    if (zombie_ != nullptr) {
+        WaitForSingleObject(zombie_, 2000);
+        CloseHandle(zombie_);
+        zombie_ = nullptr;
+    }
+    run_flag_ = std::make_shared<std::atomic<bool>>(false);
+    th_ = std::thread([this, f = run_flag_] { RunLoop(*f); });
 }
 
 void Worker::Stop()
 {
     if (!started_.exchange(false)) return;
-    stop_ = true;
+    stop_ = true;            // 动作线程取消（CancelFlag 消费方）
+    run_flag_->store(true);  // 轮询线程本轮专属停止
     cv_.notify_all();
     if (!th_.joinable()) return;
     if (th_.get_id() == std::this_thread::get_id()) {
@@ -146,12 +158,13 @@ void Worker::Stop()
     }
     // 有界等待：进程退出时 ExitProcess 已终止线程，句柄即刻有信号（实测 join <1ms）。
     // 3 秒兜底：万一线程还活着（正卡在一次 HTTP），detach 后其模块引用会继续钉住
-    // 映像，代码页不会失效（已实测）；同时把 started_ 抬回去，防止后续 Start()
-    // 在旧线程未死时叠出第二个轮询线程。
+    // 映像，代码页不会失效（已实测）；句柄记入 zombie_，由下一任 Start 有界等待后
+    // 关闭——旧线程持有专属 run_flag_（已置位），必在当前轮询迭代收尾退出，
+    // started_ 不再需要抬回 true（旧实现因此永久废掉后续 Start，已修复）。
     if (WaitForSingleObject(th_.native_handle(), 3000) == WAIT_OBJECT_0) {
         th_.join();
     } else {
-        started_ = true;
+        zombie_ = th_.native_handle();
         th_.detach();
     }
 }
@@ -221,13 +234,14 @@ void Worker::NoteLocked(Snapshot& s, const std::wstring& note)
 // 轮询主循环
 // ============================================================================
 
-void Worker::RunLoop()
+void Worker::RunLoop(const std::atomic<bool>& run_stop)
 {
     LogI(L"worker 线程启动");
-    while (!stop_.load()) {
+    while (!run_stop.load()) {
         ULONGLONG now = GetTickCount64();
         Settings s = SettingsStore::Instance().Get();
         if (now >= next_base_ || refresh_flag_.exchange(false)) {
+            MaybeStartWithTm();
             PollOnce();
             next_base_ = GetTickCount64() + 1000ULL * s.poll_interval_sec;
         }
@@ -241,9 +255,24 @@ void Worker::RunLoop()
         }
         std::unique_lock<std::mutex> lk(cv_mu_);
         cv_.wait_for(lk, std::chrono::milliseconds(500),
-            [this] { return stop_.load() || refresh_flag_.load(); });
+            [this, &run_stop] { return run_stop.load() || refresh_flag_.load(); });
     }
     LogI(L"worker 线程退出");
+}
+
+// start_with_tm：随 TM 启动拉起服务。旧实现派生 sleep(2s) 的裸 detach 线程（卸载竞态，
+// 见 plugin.cpp EnsureInited 注释）；挪到首轮 PollOnce 之前执行——此刻 TM 桌面/网络
+// 就绪度与旧方案的"2 秒后"相当（TM 加载插件到首绘本就有间隙），且判定失败只顺延到
+// 下轮轮询重试一次，同类互斥由 BeginAct("svc") 保证。
+void Worker::MaybeStartWithTm()
+{
+    if (start_tm_done_) return;
+    start_tm_done_ = true;
+    Settings s = SettingsStore::Instance().Get();
+    if (!s.start_with_tm || s.service_dir.empty()) return;
+    if (State() != SvcState::Stopped) return; // 已在跑/被占用：不干预
+    LogI(L"start_with_tm: 拉起服务");
+    RequestStartService();
 }
 
 void Worker::PollOnce()
@@ -710,6 +739,8 @@ void Worker::BuildDisplayLocked()
 // 整数数组替换为 hours。服务端没有改 hours 的接口（且 hours 热改需重启进程），
 // 所以由插件直写配置文件：解析后整体重dump（未知字段原值保留，键序会按字典序重排、
 // 统一 2 空格缩进），改前备份 .bak，tmp+rename 原子替换；内容未变则不落盘不提示。
+// 覆盖防护：写回前复核 mtime，与服务端（任务勾选 PATCH 会落盘）并发写时放弃本次并
+// 提示重试，避免用旧副本把服务端刚持久化的改动静默回滚（审查 Medium 项）。
 static std::wstring SetTaskHours(const std::wstring& config_path, const std::string& key,
     const std::vector<int>& hours)
 {
@@ -717,6 +748,8 @@ static std::wstring SetTaskHours(const std::wstring& config_path, const std::str
     HANDLE h = CreateFileW(config_path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return L"读取 config.json 失败（路径不对或无权限）";
+    FILETIME mt{};
+    BOOL mt_ok = GetFileTime(h, nullptr, nullptr, &mt);
     std::string raw;
     char buf[8192];
     DWORD got = 0;
@@ -734,6 +767,18 @@ static std::wstring SetTaskHours(const std::wstring& config_path, const std::str
 
     std::string new_raw = root.dump(2) + "\n";
     if (new_raw == raw) return L""; // 内容未变：不落盘、不提示
+
+    // mtime 复核：读与写之间文件被改过（服务端并发落盘）→ 放弃，让用户重试
+    HANDLE ck = CreateFileW(config_path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (ck != INVALID_HANDLE_VALUE) {
+        FILETIME mt2{};
+        BOOL ok2 = GetFileTime(ck, nullptr, nullptr, &mt2);
+        CloseHandle(ck);
+        if (ok2 && mt_ok &&
+            (mt2.dwLowDateTime != mt.dwLowDateTime || mt2.dwHighDateTime != mt.dwHighDateTime))
+            return L"config.json 在读取后又被修改（服务端并发写入），为防覆盖已放弃；请重试";
+    }
 
     // .bak 备份（覆盖式，与 /admin/tasks 的 patchConfigBool 行为一致）
     HANDLE b = CreateFileW((config_path + L".bak").c_str(), GENERIC_WRITE, 0, nullptr,
@@ -762,6 +807,7 @@ bool Worker::RequestSetTaskHours(const std::string& kind, const std::vector<int>
     std::string key = "taskhours:" + kind;
     if (!BeginAct(key)) return false;
     std::thread([this, kind, hours, key] {
+        if (stop_.load()) { EndAct(key); return; } // 宿主卸载：不开工直接退场
         Settings s = SettingsStore::Instance().Get();
         std::wstring note;
         if (s.service_dir.empty()) {
@@ -782,7 +828,7 @@ bool Worker::RequestSetTaskHours(const std::string& kind, const std::vector<int>
         }
         Update([&](Snapshot& sn) { NoteLocked(sn, note); });
         EndAct(key);
-        RefreshSoon();
+        if (!stop_.load()) RefreshSoon();
     }).detach();
     return true;
 }
@@ -797,13 +843,15 @@ bool Worker::RequestStartService()
 {
     if (!BeginAct("svc")) return false;
     std::thread([this] {
+        if (stop_.load()) { EndAct("svc"); return; } // 宿主卸载：不开工直接退场
         SetUserStopped(false);
         Update([](Snapshot& sn) {
             sn.state = SvcState::Starting;
             NoteLocked(sn, L"正在启动服务…");
         });
         std::wstring err;
-        bool ok = proc::StartService(err);
+        bool ok = proc::StartService(err, &stop_);
+        if (stop_.load()) { EndAct("svc"); return; } // 取消后不碰快照/日志，尽快退场
         Update([&](Snapshot& sn) {
             NoteLocked(sn, ok ? L"服务已启动" : L"启动失败：" + err);
         });
@@ -818,9 +866,11 @@ bool Worker::RequestStopService()
 {
     if (!BeginAct("svc")) return false;
     std::thread([this] {
+        if (stop_.load()) { EndAct("svc"); return; }
         SetUserStopped(true); // 抑制自动拉起（持久化：跨 TM 重启也记住"是用户主动停的"）
         std::wstring err;
-        bool ok = proc::StopService(err);
+        bool ok = proc::StopService(err, &stop_);
+        if (stop_.load()) { EndAct("svc"); return; }
         Update([&](Snapshot& sn) {
             NoteLocked(sn, ok ? L"服务已停止" : L"停止失败：" + err);
             if (ok) { sn.state = SvcState::Stopped; sn.pid = 0; }
@@ -835,19 +885,23 @@ bool Worker::RequestRestartService()
 {
     if (!BeginAct("svc")) return false;
     std::thread([this] {
+        if (stop_.load()) { EndAct("svc"); return; }
         SetUserStopped(false);
         std::wstring err;
-        if (!proc::StopService(err)) {
+        if (!proc::StopService(err, &stop_)) {
+            if (stop_.load()) { EndAct("svc"); return; }
             Update([&](Snapshot& sn) { NoteLocked(sn, L"重启失败（停止步骤）：" + err); });
             EndAct("svc");
             RefreshSoon();
             return;
         }
+        if (stop_.load()) { EndAct("svc"); return; }
         Update([](Snapshot& sn) {
             sn.state = SvcState::Starting;
             NoteLocked(sn, L"正在重启服务…");
         });
-        bool ok = proc::StartService(err);
+        bool ok = proc::StartService(err, &stop_);
+        if (stop_.load()) { EndAct("svc"); return; }
         Update([&](Snapshot& sn) {
             NoteLocked(sn, ok ? L"服务已重启" : L"重启失败：" + err);
         });
@@ -862,11 +916,13 @@ bool Worker::RequestRunTask(const std::string& kind)
     std::string key = "task:" + kind;
     if (!BeginAct(key)) return false;
     std::thread([this, kind, key] {
+        if (stop_.load()) { EndAct(key); return; }
         Settings s = SettingsStore::Instance().Get();
         std::string bearer = SettingsStore::Instance().CurrentApiKey();
         std::wstring url = WideFormat(L"http://127.0.0.1:%d/admin/tasks/run", s.port);
         json body{ { "kind", kind } };
         HttpResponse r = HttpJson(L"POST", url, bearer, body.dump(), 8000);
+        if (stop_.load()) { EndAct(key); return; }
         std::wstring note;
         if (r.status == 202) {
             json j; try { j = json::parse(r.body); } catch (...) {}
@@ -901,11 +957,13 @@ bool Worker::RequestToggleTask(const std::string& kind, bool enabled)
     std::string key = "task:" + kind;
     if (!BeginAct(key)) return false;
     std::thread([this, kind, enabled, key] {
+        if (stop_.load()) { EndAct(key); return; }
         Settings s = SettingsStore::Instance().Get();
         std::string bearer = SettingsStore::Instance().CurrentApiKey();
         std::wstring url = WideFormat(L"http://127.0.0.1:%d/admin/tasks", s.port);
         json body{ { "kind", kind }, { "enabled", enabled } };
         HttpResponse r = HttpJson(L"PATCH", url, bearer, body.dump(), 4000);
+        if (stop_.load()) { EndAct(key); return; }
         std::wstring note;
         bool mark = enabled;
         if (r.status == 200) {
@@ -938,11 +996,13 @@ bool Worker::RequestRefreshCredits()
 {
     if (!BeginAct("credits")) return false;
     std::thread([this] {
+        if (stop_.load()) { EndAct("credits"); return; }
         Settings s = SettingsStore::Instance().Get();
         std::string bearer = SettingsStore::Instance().CurrentApiKey();
         std::wstring url = WideFormat(L"http://127.0.0.1:%d/admin/credits", s.port);
         // 每号一次上游查询（服务端已限速+冷却）；本地网络到 loopback，放宽到 120s 纯防卡死。
         HttpResponse r = HttpJson(L"POST", url, bearer, "{}", 120000);
+        if (stop_.load()) { EndAct("credits"); return; }
         std::wstring note;
         if (r.status == 200) {
             json j;
@@ -986,12 +1046,14 @@ void Worker::RequestSyncCreditsInterval(int minutes)
     const std::string key = "credits_interval";
     if (!BeginAct(key)) return; // 上一次同步还没回来：丢弃本次（保存路径连点防护）
     std::thread([this, minutes, key] {
+        if (stop_.load()) { EndAct(key); return; }
         Settings s = SettingsStore::Instance().Get();
         std::string bearer = SettingsStore::Instance().CurrentApiKey();
         std::wstring base = WideFormat(L"http://127.0.0.1:%d", s.port);
         json body{ { "interval_sec", minutes * 60 } };
         // 5 秒：loopback 小请求的宽裕上限
         HttpResponse r = HttpJson(L"PATCH", base + L"/admin/credits-interval", bearer, body.dump(), 5000);
+        if (stop_.load()) { EndAct(key); return; }
         std::wstring note;
         if (r.status == 200) {
             json j; try { j = json::parse(r.body); } catch (...) {}

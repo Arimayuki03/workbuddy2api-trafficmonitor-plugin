@@ -103,7 +103,7 @@ bool ServiceFilesOk(std::wstring& err)
     return true;
 }
 
-bool StartService(std::wstring& err)
+bool StartService(std::wstring& err, const std::atomic<bool>* cancel)
 {
     if (!ServiceFilesOk(err)) return false;
     Settings s = SettingsStore::Instance().Get();
@@ -141,7 +141,8 @@ bool StartService(std::wstring& err)
         LogI(L"start: 进程已创建，等待就绪");
         created = true;
     }
-    if (!WaitHealthzReady(15000)) {
+    if (!WaitHealthzReady(15000, cancel)) {
+        if (cancel && cancel->load()) return false; // 取消：不必再报告就绪超时
         // 走"端口已被自家服务占用"分支时根本没有创建进程：超时多半是原本就占着端口的
         // （可能僵死的）服务没就绪，与"新拉起的进程没就绪"分开表述，避免误导排查方向。
         err = created
@@ -152,7 +153,7 @@ bool StartService(std::wstring& err)
     return true;
 }
 
-bool StopService(std::wstring& err)
+bool StopService(std::wstring& err, const std::atomic<bool>* cancel)
 {
     Settings s = SettingsStore::Instance().Get();
     Listener l = FindPortListener(s.port);
@@ -173,6 +174,7 @@ bool StopService(std::wstring& err)
     }
     // 等端口释放最多 3 秒（覆盖 admin 优雅路径），超时兜底 TerminateProcess
     for (int i = 0; i < 30; i++) {
+        if (cancel && cancel->load()) return false;
         if (!FindPortListener(s.port).found) return true;
         Sleep(100);
     }
@@ -185,6 +187,7 @@ bool StopService(std::wstring& err)
     if (ok) WaitForSingleObject(h, 2000);
     CloseHandle(h);
     for (int i = 0; i < 20; i++) {
+        if (cancel && cancel->load()) return false;
         if (!FindPortListener(s.port).found) return true;
         Sleep(100);
     }
@@ -192,12 +195,13 @@ bool StopService(std::wstring& err)
     return false;
 }
 
-bool WaitHealthzReady(int timeout_ms)
+bool WaitHealthzReady(int timeout_ms, const std::atomic<bool>* cancel)
 {
     Settings s = SettingsStore::Instance().Get();
     std::wstring url = WideFormat(L"http://127.0.0.1:%d/healthz", s.port);
     ULONGLONG t0 = GetTickCount64();
     while (GetTickCount64() - t0 < static_cast<ULONGLONG>(timeout_ms)) {
+        if (cancel && cancel->load()) return false;
         HttpResponse r = HttpJson(L"GET", url, "", "", 800);
         // 200/503 都算"活着"：503 只代表暂无可用账号；身份必须再对一次，
         // 防"端口被别的 HTTP 服务占着"被当成启动成功。

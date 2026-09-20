@@ -39,7 +39,8 @@ private:
     bool colors_set_ = false;
     std::once_flag init_once_;
     std::mutex tt_mu_;
-    std::wstring tt_cache_;
+    std::wstring tt_buf_[2]; // 乒乓缓冲：交替写入/返回，任一次返回的指针到"再下一次
+    int tt_cur_ = 0;         // 调用"前不被改写，宿主有整帧时间完成拷贝
 };
 
 } // namespace wb2

@@ -34,7 +34,9 @@ $lines = @(
 )
 $bat = ($lines -join "`r`n") + "`r`n"
 $batFile = Join-Path $env:TEMP "wb2api_tm_build.bat"
-[System.IO.File]::WriteAllText($batFile, $bat, [System.Text.Encoding]::ASCII)
+# cmd 按"当前控制台代码页"逐行解析 bat（中文系统 = 936/ANSI）。用 ASCII 写会把路径里的
+# 中文（%TEMP% 带中文用户名、仓库放中文目录）替换成 '?' 导致构建失败；ANSI 与之一致。
+[System.IO.File]::WriteAllText($batFile, $bat, [System.Text.Encoding]::Default)
 & cmd.exe /c "`"$batFile`""
 $code = $LASTEXITCODE
 if ($code -ne 0) { throw "build failed (exit $code)" }

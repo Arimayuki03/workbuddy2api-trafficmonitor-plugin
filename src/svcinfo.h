@@ -89,7 +89,6 @@ struct Snapshot {
 
     // /healthz
     int total = 0, healthy = 0;
-    bool servable_cn = false, servable_global = false;
 
     // /status
     std::vector<AccountInfo> accounts;
@@ -97,7 +96,6 @@ struct Snapshot {
     // in_flight_full：健康但在途名额占满的账号数（账号在此计数里是 healthy，
     // 但 chat 实际选不到它——全占满时 healthz 按 ServableNow 口径仍报 503）。
     int cooling = 0, disabled_n = 0, sticky = 0, in_flight_full = 0;
-    int64_t status_ts = 0;
 
     // /admin/*
     bool admin_available = false;   // /admin/tasks 返回过 200
@@ -107,7 +105,6 @@ struct Snapshot {
 
     // 观测/诊断
     std::wstring last_error;        // 最近一次中文错误（空=正常）
-    bool need_key_note = false;     // /status 401：api_key 未配置或不符
     int64_t last_ok_ts = 0;
 
     // 动作回显（一次性提示，UI 页脚/通知用；带时间戳供"几秒内才显示"判断）

@@ -16,7 +16,7 @@ enum ShowMode {
 };
 
 struct Settings {
-    std::wstring service_dir = L"D:\\Code\\workbuddy2api"; // wb2api 安装目录（工作目录+exe+config.json）
+    std::wstring service_dir;                 // wb2api 安装目录（空=未配置；服务页「浏览…」选择）
     int port = 7863;
     int poll_interval_sec = 30;               // /healthz+/status 轮询（零上游成本，>=10）
     int admin_poll_sec = 60;                  // /admin/tasks、/admin/credits 轮询（服务端本地缓存）

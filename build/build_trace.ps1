@@ -18,6 +18,7 @@ $lines = @(
     'echo TRACE-BUILD-OK'
 )
 $batFile = Join-Path $env:TEMP "wb2api_trace_build.bat"
-[System.IO.File]::WriteAllText($batFile, ($lines -join "`r`n") + "`r`n", [System.Text.Encoding]::ASCII)
+# 同 build.ps1：bat 按控制台代码页解析，中文路径用 ASCII 写会变 '?'。
+[System.IO.File]::WriteAllText($batFile, ($lines -join "`r`n") + "`r`n", [System.Text.Encoding]::Default)
 & cmd.exe /c "`"$batFile`""
 if ($LASTEXITCODE -ne 0) { throw "trace build failed" }

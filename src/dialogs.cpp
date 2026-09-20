@@ -275,10 +275,39 @@ void FillAccountList(Ctx& c, const Snapshot& sn)
             else
                 st = a.until > nowx ? L"冷却至 " + FormatTimeShort(a.until) : L"冷却中";
         }
-        else if (a.rl_models > 0) st = a.rl_until > NowSecX()
-            ? WideFormat(L"模型限额×%d(至%s)", (int)a.rl_models, FormatTimeShort(a.rl_until).c_str())
-            : WideFormat(L"模型限额×%d", (int)a.rl_models);
-        else if (a.in_flight > 0) st = WideFormat(L"请求中(%d)", a.in_flight);
+        else if (a.rl_models > 0) {
+            // 限流模型指名道姓：单模型直接给名（"模型限额 glm-4.6 至 14:00"），
+            // 多模型列前 2 个 + "共N个"（总数惯用法，与 worker.cpp tooltip 同口径）。
+            // 明细缺失（旧版服务端）回退数量口径。
+            if (a.rl_detail.empty())
+                st = a.rl_until > NowSecX()
+                    ? WideFormat(L"模型限额×%d(至%s)", (int)a.rl_models, FormatTimeShort(a.rl_until).c_str())
+                    : WideFormat(L"模型限额×%d", (int)a.rl_models);
+            else {
+                std::wstring names = a.rl_detail[0].model;
+                if (a.rl_detail.size() > 1) {
+                    names += L"、" + a.rl_detail[1].model;
+                    if (a.rl_detail.size() > 2)
+                        names += WideFormat(L"共%d个", (int)a.rl_detail.size());
+                }
+                st = L"模型限额 " + names;
+                if (a.rl_until > NowSecX()) st += WideFormat(L"(至%s)", FormatTimeShort(a.rl_until).c_str());
+            }
+        }
+        else if (a.in_flight > 0) {
+            // 在途模型指名道姓（fork 的 in_flight_by_model）：多模型 "glm-4.6×2+glm-4.5"，
+            // 台账缺失回退纯计数。单元格宽度有限，最多列 2 个模型。
+            if (a.in_flight_models.empty())
+                st = WideFormat(L"请求中(%d)", a.in_flight);
+            else {
+                st = L"请求中 ";
+                int shown_if = 0;
+                for (auto& [mname, mcnt] : a.in_flight_models) {
+                    if (shown_if++ >= 2) { st += WideFormat(L"+%d个", (int)a.in_flight_models.size() - shown_if + 1); break; }
+                    st += (shown_if > 1 ? L"+" : L"") + WideFormat(L"%s×%d", mname.c_str(), mcnt);
+                }
+            }
+        }
         else st = L"正常";
         setcol(4, st);
         setcol(5, a.token_expiry > NowSecX()
@@ -377,8 +406,14 @@ void Refresh(Ctx& c)
             std::to_wstring(a.until) + L"|" + std::to_wstring(a.breaker_until) + L"|" +
             std::to_wstring(a.degrade_until) + L"|" + std::to_wstring(a.consec_fails) + L"|" +
             std::to_wstring(a.rl_models) + L"|" + std::to_wstring(a.token_expiry) + L"|" +
-            (a.disabled ? L"1" : L"0") + (a.manual_disabled ? L"1" : L"0") +
-            a.reason + L"|" + a.manual_reason + L";";
+            (a.disabled ? L"1" : L"0") + L"|" + (a.manual_disabled ? L"1" : L"0") + L"|" +
+            a.reason + L"|" + a.manual_reason + L"|";
+        // 明细进哈希：在途/限流的模型名变化（不只是数量）也要触发列表重建
+        for (auto& [mname, mcnt] : a.in_flight_models)
+            hash_in += mname + L":" + std::to_wstring(mcnt) + L",";
+        for (auto& rm : a.rl_detail)
+            hash_in += rm.model + L":" + std::to_wstring(rm.until) + L",";
+        hash_in += L";";
     }
     for (auto& r : sn.credits.rows) {
         hash_in += r.uid8 + L"|" + std::to_wstring(r.remain) + L"|" +
@@ -704,6 +739,23 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
                     m.last_seen ? FormatTimeShort(m.last_seen).c_str() : L"-");
             }
             box += L"\n选号按便宜优先；≤0=实测免费，数字为积分/千 token。";
+        }
+        // 按模型用量（/v1/stats）：全网关口径的累计消耗，与上面的单账号单价互补。
+        if (sn.stats_available) {
+            box += L"\n—— 模型用量（服务本次运行累计）——\n";
+            if (sn.usage.empty()) {
+                box += L"（服务启动后还没有任何请求）";
+            } else {
+                box += L"模型｜消耗积分｜请求｜均/次\n";
+                for (auto& u : sn.usage)
+                    box += WideFormat(L"%s｜%s｜%d｜%s\n", u.model.c_str(),
+                        FormatCreditNum(u.credit).c_str(), (int)u.requests,
+                        FormatCreditNum(u.credit_per_req).c_str());
+                box += L"\n服务端内存聚合，重启清零（自 " +
+                    FormatTimeShort(sn.stats_ts) + L" 后拉取的快照）。";
+            }
+        } else {
+            box += L"\n（模型用量：需 wb2api 支持 /v1/stats，升级服务端后可用）";
         }
         MessageBoxW(hDlg, box.c_str(), L"成本台账", MB_OK);
         return TRUE;

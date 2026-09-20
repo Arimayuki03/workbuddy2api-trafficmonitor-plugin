@@ -36,6 +36,8 @@ inline std::wstring TrimW(std::wstring s)
 std::wstring FormatCreditsCompact(int64_t v);
 // 千分位（tooltip 用）。
 std::wstring FormatThousands(int64_t v);
+// 浮点积分（/v1/stats credit）：整值千分位不带小数，小值 2 位有效去尾零。
+std::wstring FormatCreditNum(double v);
 
 // 时间戳（unix 秒）→ 本地 HH:mm / MM-dd HH:mm；0 → L"-"。
 std::wstring FormatTimeShort(int64_t unix_sec);

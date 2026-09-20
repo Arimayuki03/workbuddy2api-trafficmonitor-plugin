@@ -10,6 +10,7 @@
 #include "logger.h"
 #include "procctl.h"
 #include "settings.h"
+#include "trace.h"      // WB2API_TRACE_LOG（/v1/stats 404 静默期跳过日志；trace.h 在构建脚本里）
 #include <nlohmann/json.hpp>
 #include <cstdio>
 #include <cstring>
@@ -378,12 +379,28 @@ void Worker::PollOnce()
                         ai.degrade_until = RfcToUnix(JStr(a, "degrade_until"));
                         ai.consec_fails = (int)JInt(a, "consecutive_fails");
                         // 模型级限额（issue #36）：账号健康但这些模型还在独立冷却。
+                        // 明细行带模型名与双时钟（until=截断后冷却截止，reset_at=上游
+                        // 原始重置墙钟），状态列/tooltip 指名道姓；rl_models 保留总数口径。
                         if (a.contains("rate_limited_models") && a["rate_limited_models"].is_array()) {
                             for (auto& m : a["rate_limited_models"]) {
                                 if (!m.is_object()) continue;
                                 ai.rl_models++;
-                                int64_t mu = RfcToUnix(JStr(m, "until"));
-                                if (mu > ai.rl_until) ai.rl_until = mu;
+                                RlModel rm;
+                                rm.model = Utf8ToWide(JStr(m, "model"));
+                                rm.until = RfcToUnix(JStr(m, "until"));
+                                rm.reset_at = RfcToUnix(JStr(m, "reset_at"));
+                                rm.reason = Utf8ToWide(JStr(m, "reason"));
+                                if (rm.until > ai.rl_until) ai.rl_until = rm.until;
+                                ai.rl_detail.push_back(std::move(rm));
+                            }
+                        }
+                        // 每模型在途台账（fork 扩展）：模型名 → 计数，只含正在请求的模型。
+                        if (a.contains("in_flight_by_model") && a["in_flight_by_model"].is_object()) {
+                            for (auto it = a["in_flight_by_model"].begin();
+                                 it != a["in_flight_by_model"].end(); ++it) {
+                                if (!it.value().is_number_integer()) continue;
+                                ai.in_flight_models.emplace_back(
+                                    Utf8ToWide(it.key()), (int)it.value().get<int>());
                             }
                         }
                         // 成本台账（上游 2493532）：每模型一行，双行弹窗展示（不进 tooltip，控长度）。
@@ -499,6 +516,48 @@ void Worker::PollAdmin()
     CreditsInfo ci;
     ParseCreditsJson(cj, ci);
     Update([&](Snapshot& sn) { sn.credits = std::move(ci); });
+
+    // /v1/stats 按模型用量（GET，与 /status 同源 api_key 鉴权）：credit=该模型累计
+    // 消耗积分，服务端进程内存聚合（重启清零）。404=旧版服务端无此接口：记下探测
+    // 时刻并静默 30 分钟再重探——旧版周期性白发请求是浪费，但保留低频重探才能在
+    // 服务端热升级后自动恢复（重启探活由 state 变化兜底，不依赖本间隔）。
+    {
+        bool skip = false;
+        Update([&](Snapshot& sn) {
+            if (!sn.stats_available && sn.stats_ts > 0)
+                skip = NowSec() - sn.stats_ts < 1800;
+        });
+        if (skip) { WB2API_TRACE_LOG("PollAdmin: skip /v1/stats (404 cooldown)"); return; }
+    }
+    HttpResponse vr = HttpJson(L"GET", base + L"/v1/stats", key, "", 3000);
+    if (vr.status == 200) {
+        json vj;
+        try { vj = json::parse(vr.body); } catch (...) { return; }
+        if (!vj.is_object() || !vj.contains("models") || !vj["models"].is_array()) return;
+        std::vector<ModelUsage> usage;
+        for (auto& m : vj["models"]) {
+            if (!m.is_object()) continue;
+            ModelUsage mu;
+            mu.model = Utf8ToWide(JStr(m, "model"));
+            if (mu.model.empty()) continue;
+            mu.requests = JInt(m, "requests");
+            mu.credit = JNum(m, "credit");
+            mu.credit_per_req = JNum(m, "credit_per_req");
+            mu.total_tokens = JInt(m, "total_tokens");
+            usage.push_back(std::move(mu));
+        }
+        Update([&](Snapshot& sn) {
+            sn.stats_available = true;
+            sn.stats_ts = (int64_t)time(nullptr);
+            sn.usage = std::move(usage);
+        });
+    } else if (vr.status == 404) {
+        // stats_ts 记最后探测时刻（非成功时刻）：既是 30 分钟重探间隔的锚点，
+        // 也让 tooltip 的"需升级服务端"提示有条件成立（老版本从不置 stats_ts 的话
+        // 提示永不显示——OCR 审查确认的口径分裂）。
+        Update([](Snapshot& sn) { sn.stats_available = false; sn.usage.clear();
+                                  sn.stats_ts = (int64_t)time(nullptr); });
+    }
 }
 
 // ============================================================================
@@ -655,6 +714,39 @@ void Worker::BuildDisplayLocked()
             else if (a.cooling) note = L"冷却中";
             else if (a.in_flight > 0) note = L"请求中";
             else note = L"正常";
+            // 在途模型（fork 的 in_flight_by_model）：账号有在途请求时指名道姓，
+            // "请求中"升级为"请求中 glm-4.6×2"；无台账（旧版服务端/恰好归零）回退纯计数。
+            if (a.in_flight > 0 && !a.in_flight_models.empty()) {
+                note = L"请求中";
+                // 与限流明细同口径最多列 2 个：账号并发多模型时防 tooltip 顶到
+                // 宿主 1024 字符硬限（BuildDisplayLocked 尾注）。
+                int shown_if = 0;
+                for (auto& [mname, mcnt] : a.in_flight_models) {
+                    if (shown_if >= 2) {
+                        note += WideFormat(L" +%d个", (int)a.in_flight_models.size() - shown_if);
+                        break;
+                    }
+                    note += WideFormat(L" %s×%d", mname.c_str(), mcnt);
+                    shown_if++;
+                }
+            }
+            // 模型级限流明细（issue #36 的 rate_limited_models）：指名道姓带恢复时刻，
+            // 最多列 2 个防 tooltip 膨胀，更多用 "共N个" 收口（"A、B共3个"是总数惯用法）。
+            if (!a.rl_detail.empty()) {
+                std::wstring rls;
+                int shown_rl = 0;
+                for (auto& rm : a.rl_detail) {
+                    if (shown_rl >= 2) break;
+                    rls += (rls.empty() ? L"" : L"、") + rm.model;
+                    shown_rl++;
+                }
+                if ((int)a.rl_detail.size() > 2)
+                    rls += WideFormat(L"共%d个", (int)a.rl_detail.size());
+                note += WideFormat(L" 限流[%s", rls.c_str());
+                if (a.rl_until > NowSec())
+                    note += WideFormat(L" %s恢复", FormatTimeShort(a.rl_until).c_str());
+                note += L"]";
+            }
             std::wstring live;
             if (sn.credits.have) {
                 for (auto& c : sn.credits.rows) {
@@ -695,6 +787,22 @@ void Worker::BuildDisplayLocked()
                 FormatThousands(sn.credits.total_remain).c_str(), usedtxt.c_str(),
                 FormatTimeShort(sn.credits.ts).c_str(),
                 FormatTimeShort(sn.credits.cooldown_until).c_str()));
+        }
+        // 按模型用量（/v1/stats）：每个模型自服务启动以来消耗的积分与请求数。
+        // credit 是上游 usage.credit 的累计和（真实扣费口径）；服务重启清零。
+        if (sn.stats_available && !sn.usage.empty()) {
+            lines.push_back(L"—— 模型用量（本次运行累计）——");
+            int shown_u = 0;
+            for (auto& u : sn.usage) {
+                if (shown_u++ >= 6) { lines.push_back(L"  …"); break; }
+                lines.push_back(WideFormat(L"  %s：%s分 / %d次（均 %s/次）",
+                    u.model.c_str(), FormatCreditNum(u.credit).c_str(),
+                    (int)u.requests, FormatCreditNum(u.credit_per_req).c_str()));
+            }
+        } else if (!sn.stats_available && sn.stats_ts > 0 && NowSec() - sn.stats_ts < 1800) {
+            // 最近 30 分钟内探测过（200 或 404 都置 stats_ts）且当前不可用：
+            // 提示升级服务端；超 30 分钟视为探测信息过期，不再占 tooltip 行。
+            lines.push_back(L"模型用量：需 wb2api ≥ v1/stats 接口（升级服务端）");
         }
     }
 

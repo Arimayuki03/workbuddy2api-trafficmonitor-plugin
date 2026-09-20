@@ -1,6 +1,7 @@
 // svcinfo.h — 快照数据模型（worker 写、UI/自绘读；一律在 Worker 的锁内整体替换）。
 #pragma once
 #include <string>
+#include <utility>
 #include <vector>
 #include <cstdint>
 #include <windows.h>
@@ -29,6 +30,27 @@ struct ModelCost {
     int64_t last_seen = 0;    // 末次观测（unix 秒）
 };
 
+// 限流模型明细行（wb2api /status accounts[].rate_limited_models，issue #36）：
+// until=该模型独立冷却截止（unix 秒）；reset_at=上游原始重置墙钟（未截断时同 until）。
+// reset_at/reason 已解析但暂未上界面——reset_at 截断语义（Until 被 soft_rate_max
+// 截短时 ResetAt 才是真恢复点）与 reason 原文留给后续 tooltip 扩展，不删。
+struct RlModel {
+    std::wstring model;
+    int64_t until = 0;
+    int64_t reset_at = 0;
+    std::wstring reason;
+};
+
+// 按模型用量统计行（wb2api GET /v1/stats models[]，进程内存聚合、重启清零）：
+// credit=该模型累计消耗积分（上游 usage.credit 之和）；credit_per_req=单次均值。
+struct ModelUsage {
+    std::wstring model;
+    int64_t requests = 0;
+    double credit = 0;
+    double credit_per_req = 0;
+    int64_t total_tokens = 0;
+};
+
 struct AccountInfo {
     std::string uid;          // 原始 uid（auths 文件扫描合并用，不上界面）
     std::wstring uid8;
@@ -54,7 +76,11 @@ struct AccountInfo {
     // 非空即这些模型暂不可用，其他模型照常可选。
     size_t rl_models = 0;
     int64_t rl_until = 0;         // 限额模型中最远恢复时刻
+    std::vector<RlModel> rl_detail; // 限流模型明细（状态列/tooltip 指名道姓）
     std::vector<ModelCost> costs; // 成本台账（双击账户行弹窗展示）
+    // 每模型在途请求数（/status accounts[].in_flight_by_model，fork 扩展）：
+    // 模型名 → 计数；只含正在请求的模型（服务端归零即删行）。
+    std::vector<std::pair<std::wstring, int>> in_flight_models;
     int in_flight = 0;
     int64_t token_expiry = 0; // 本地 auths 文件扫描（unix 秒；0=未知）
 };
@@ -108,6 +134,11 @@ struct Snapshot {
     std::vector<TaskInfo> tasks;
     int64_t tasks_ts = 0;
     CreditsInfo credits;
+
+    // /v1/stats 按模型用量（进程内存聚合，服务重启清零；不可用时为空）
+    bool stats_available = false;   // /v1/stats 返回过 200
+    int64_t stats_ts = 0;           // 末次状态变更时刻（200=成功拉取；404=最后探测，重探间隔用）
+    std::vector<ModelUsage> usage;  // 按请求数降序（服务端默认序）
 
     // 观测/诊断
     std::wstring last_error;        // 最近一次中文错误（空=正常）

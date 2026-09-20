@@ -71,6 +71,21 @@ std::wstring FormatThousands(int64_t v)
     return out;
 }
 
+// 浮点积分（/v1/stats 的 credit 为 double）：整值不带小数，小值保留 2 位有效。
+// 0 显示 "0"（无观测与真 0 在服务端聚合里无法区分，均按 0 展示）。
+std::wstring FormatCreditNum(double v)
+{
+    if (v >= 100 || v == static_cast<long long>(v))
+        return FormatThousands(static_cast<int64_t>(v));
+    wchar_t buf[32];
+    swprintf(buf, 32, L"%.2f", v);
+    std::wstring s(buf);
+    // 去尾零：0.50→0.5，0.00 已在上面整值分支按 "0" 输出
+    while (s.size() > 1 && s.back() == L'0' && s[s.size() - 2] != L'.')
+        s.pop_back();
+    return s;
+}
+
 std::wstring FormatTimeShort(int64_t unix_sec)
 {
     if (unix_sec <= 0) return L"-";

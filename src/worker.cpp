@@ -42,6 +42,97 @@ std::string JStr(const json& j, const char* k)
     if (it == j.end() || !it->is_string()) return {};
     return it->get<std::string>();
 }
+
+// tooltip 字符预算。宿主 MFC 对喂给 CToolTipCtrl::UpdateTipText 的文本有 1024 字符硬限
+// （超限抛 CInvalidArgException → 弹"遇到不适当的参数。"），而 TM 把所有插件的 tooltip
+// 拼成一条：TM 自身 ~300、其余插件占用不可控。实测本插件完整展开（8 账号+6 任务+模型
+// 用量）739 字符曾三插件同载弹框；拼接总额插件侧无法观测，只能按最坏共存定预算：
+// 700 ≈ 原版完整形态（实测 739）去掉最长一段账户明细的余量——正常运行显示效果与
+// v1.5.0 一致，只在账户数暴增等极端轮询结果下才逐行收敛。
+constexpr size_t kTipBudget = 700;
+
+// 用 "\r\n" 连接（tooltip 专用：宿主 MFC 对裸 \n 渲染异常）。
+std::wstring JoinLines(const std::vector<std::wstring>& lines)
+{
+    std::wstring out;
+    for (size_t i = 0; i < lines.size(); i++) {
+        if (i) out += L"\r\n";
+        out += lines[i];
+    }
+    return out;
+}
+
+// 该账号是否被用户隐藏出 tooltip（tip_hidden_uids 线性查找：账号 ≤ 常规两位数）
+bool TipUidHidden(const Settings& st, const std::wstring& uid8)
+{
+    for (auto& u : st.tip_hidden_uids)
+        if (u == uid8) return true;
+    return false;
+}
+
+// 预算内取舍：从尾部逐行舍弃非骨架行（自然顺序即"模型用量 → 积分汇总 → 定时任务 →
+// 账户明细"，离骨架越远越不重要）；若删到节标题成为末行则连标题一起删，不留悬空标题。
+// 骨架行（状态头/地址/健康概要/提示/最近操作/尾注）永不舍弃。全删后仍超预算（极端长
+// 字段）才对最后一行硬截加省略号。有舍弃时在骨架尾注前补一行"…"提示信息被省略。
+std::wstring FitTipBudget(std::vector<std::wstring> lines, size_t budget)
+{
+    auto is_skeleton = [](const std::wstring& s) {
+        if (s.empty()) return false;
+        if (s.rfind(L"WorkBuddy2API：", 0) == 0) return true; // 状态头
+        if (s.rfind(L"地址：", 0) == 0) return true;
+        if (s.rfind(L"健康 ", 0) == 0) return true; // 健康概要（含在途满载附注）
+        if (s.rfind(L"提示：", 0) == 0) return true; // 轮询层 last_error
+        if (s.rfind(L"最近操作：", 0) == 0) return true;
+        return s == L"单击此栏位打开设置";
+    };
+    auto is_title = [](const std::wstring& s) {
+        return s.size() >= 4 && s.rfind(L"——", 0) == 0 &&
+            s.find(L"——", 2) != std::wstring::npos;
+    };
+    auto total = [&lines] {
+        size_t t = 0;
+        for (auto& l : lines) t += l.size() + 2;
+        return t;
+    };
+
+    bool dropped = false;
+    for (size_t t = total(); t > budget;) {
+        // 找末个非骨架行（尾注在最后，其前的提示/操作行是骨架，故倒序首个命中即有效）
+        size_t last = lines.size();
+        while (last-- > 0)
+            if (!is_skeleton(lines[last])) break;
+        if (last == SIZE_MAX) break; // 只剩骨架：无的可删
+        t -= lines[last].size() + 2;
+        lines.erase(lines.begin() + last);
+        dropped = true;
+        // 删完成员后节标题成了末个非骨架行 → 连标题删（悬空标题没有信息量）
+        size_t prev = last;
+        while (prev-- > 0)
+            if (!is_skeleton(lines[prev])) break;
+        if (prev != SIZE_MAX && is_title(lines[prev])) {
+            t -= lines[prev].size() + 2;
+            lines.erase(lines.begin() + prev);
+        }
+    }
+    std::wstring out = JoinLines(lines);
+    if (dropped) {
+        // 在骨架尾注前补"…"（预算装得下才补；补不进说明骨架自身已顶满，放弃提示）
+        std::wstring note = L"单击此栏位打开设置";
+        size_t note_pos = out.rfind(L"\r\n" + note);
+        std::wstring ell = L"\r\n…";
+        if (note_pos != std::wstring::npos && out.size() + ell.size() <= budget) {
+            out.insert(note_pos, ell);
+        } else if (note_pos == std::wstring::npos && out.size() + ell.size() <= budget) {
+            out += ell; // 无尾注（不该发生）：直接缀尾
+        }
+    }
+    // 极端兜底：骨架行自身超预算（如超长 nickname 混进骨架不会发生，纯防呆）——硬截。
+    if (out.size() > budget) {
+        out.resize(budget - 1); // 原地截断（自引用 assign 标准不保证安全）
+        out += L"…";
+    }
+    return out;
+}
 double JNum(const json& j, const char* k, double d = 0)
 {
     auto it = j.find(k);
@@ -702,10 +793,17 @@ void Worker::BuildDisplayLocked()
     }
     if (!sn.last_error.empty()) lines.push_back(L"提示：" + sn.last_error);
 
-    if (StateIsOn(sn.state) && sn.accounts_valid && !sn.accounts.empty()) {
+    // 账户明细区（tooltip_accounts）：每账号一行是 tooltip 最大的长度来源（实测 8 号
+    // ~430 字符）。设置里可关掉，只留上面的健康概要——多插件同载挤占 1024 总额时的
+    // 主要手段；关闭后 FitTipBudget 的逐行舍弃仍有兜底作用。
+    if (st.tooltip_accounts && StateIsOn(sn.state) && sn.accounts_valid && !sn.accounts.empty()) {
         lines.push_back(L"—— 账户（估算）——");
         int shown = 0;
         for (auto& a : sn.accounts) {
+            // 单账户显隐（右键账户行切换）：隐藏的号不占 tooltip 行，但仍计入
+            // 健康概要等汇总行（那里没有 per-account 信息，无需改动）。
+            // 隐藏判断必须在 shown 计数之前，否则隐藏号白耗 8 行显示名额。
+            if (TipUidHidden(st, a.uid8)) continue;
             if (shown++ >= 8) { lines.push_back(L"…"); break; }
             std::wstring note;
             if (a.disabled && a.manual_disabled) note = L"禁用+停用";
@@ -814,15 +912,13 @@ void Worker::BuildDisplayLocked()
     //  * 换行必须用 "\r\n"——宿主把它直接喂给 MFC CToolTipCtrl，裸 \n 在部分宿主路径上渲染异常；
     //  * TM 会把所有插件的 tooltip 拼成一条再喂给 MFC CToolTipCtrl::UpdateTipText，后者对
     //    超过 1024 字符的文本抛 CInvalidArgException（宿主弹"遇到不适当的参数。"）。
-    //    TM 自身文本 ~300 字符，其余插件（MijiaPower 等）占用不可控；完整 tooltip 实测 351 字符时
-    //    三插件同载触发弹框。默认完整展开（tooltip_full），同载弹框时用户可在设置里切到折叠配额：
-    //    每行 64 字符 / 4 行 / 总长 150 字符兜底。
+    //    拼接总额插件侧无法观测，只能给自家文本上硬预算（kTipBudget）：完整展开模式超预算
+    //    时从尾部整行舍弃，骨架必留（FitTipBudget）。折叠模式（tooltip_full=false）是
+    //    更省的手动逃生口：每行 64 字符 / 4 行 / 总长 150 字符兜底。
     if (st.tooltip_full) {
-        tooltip_w_.clear();
-        for (size_t i = 0; i < lines.size(); i++) {
-            if (i) tooltip_w_ += L"\r\n";
-            tooltip_w_ += lines[i];
-        }
+        tooltip_w_.assign(JoinLines(lines));
+        if (tooltip_w_.size() > kTipBudget)
+            tooltip_w_.assign(FitTipBudget(std::move(lines), kTipBudget));
         return;
     }
     auto ClipLine = [](std::wstring& s, size_t maxw) {

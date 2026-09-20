@@ -2,6 +2,7 @@
 // 全进程唯一入口 SettingsStore::Instance()；锁内只碰内存，落盘在锁外原子写。
 #pragma once
 #include <string>
+#include <vector>
 #include <mutex>
 #include <functional>
 #include <windows.h>
@@ -23,7 +24,11 @@ struct Settings {
     int credits_refresh_interval_min = 0;     // 实时积分自动刷新周期（分钟）；0=仅手动，>=1
     int show_mode = SM_STATE_ACCOUNT;
     bool show_live_credits = true;            // 显示积分时优先用实时缓存
-    bool tooltip_full = true;                 // tooltip 完整展开；关闭=折叠为 4 行/~150 字符（多插件同载防宿主 1024 超限弹框）
+    bool tooltip_full = true;                 // tooltip 完整展开（超 700 字符预算自动舍弃次要行）；关闭=折叠为 4 行/~150 字符
+    bool tooltip_accounts = true;             // tooltip 显示"账户（估算）"区明细行；关闭可显著缩短 tooltip（多插件同载挤预算时用）
+    // 单账户 tooltip 显隐（uid8 列表，落盘）：右键账户行切换。列表内的号不出现在
+    // tooltip 账户明细里，但仍计入健康/总数等汇总行；清空列表即全部显示。
+    std::vector<std::wstring> tip_hidden_uids;
     bool autostart_task = false;              // Windows 计划任务随登录启动服务
     bool start_with_tm = false;               // TrafficMonitor 启动时拉起服务
     bool auto_relaunch = false;               // 意外停止自动拉起

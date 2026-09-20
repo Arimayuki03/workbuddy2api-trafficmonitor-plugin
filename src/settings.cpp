@@ -2,6 +2,7 @@
 #include "common.h"
 #include "logger.h"
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <fstream>
 
 namespace wb2 {
@@ -48,6 +49,18 @@ Settings ParseSettings(const json& j)
     get_int("show_mode", s.show_mode);
     get_bool("show_live_credits", s.show_live_credits);
     get_bool("tooltip_full", s.tooltip_full);
+    get_bool("tooltip_accounts", s.tooltip_accounts);
+    // tip_hidden_uids：字符串数组（可选，旧配置没有即空列表=全部显示）。
+    // 去重 + 丢空串：手改 json 或异常路径不会留下重复/无效条目。
+    if (j.contains("tip_hidden_uids") && j["tip_hidden_uids"].is_array())
+        for (const auto& e : j["tip_hidden_uids"]) {
+            if (!e.is_string()) continue;
+            std::wstring uid = Utf8ToWide(e.get<std::string>());
+            if (uid.empty()) continue;
+            if (std::find(s.tip_hidden_uids.begin(), s.tip_hidden_uids.end(), uid) ==
+                s.tip_hidden_uids.end())
+                s.tip_hidden_uids.push_back(std::move(uid));
+        }
     get_bool("autostart_task", s.autostart_task);
     get_bool("start_with_tm", s.start_with_tm);
     get_bool("auto_relaunch", s.auto_relaunch);
@@ -86,6 +99,12 @@ json SerializeSettings(const Settings& s)
     j["show_mode"] = s.show_mode;
     j["show_live_credits"] = s.show_live_credits;
     j["tooltip_full"] = s.tooltip_full;
+    j["tooltip_accounts"] = s.tooltip_accounts;
+    {
+        json arr = json::array();
+        for (const auto& u : s.tip_hidden_uids) arr.push_back(WideToUtf8(u));
+        j["tip_hidden_uids"] = arr;
+    }
     j["autostart_task"] = s.autostart_task;
     j["start_with_tm"] = s.start_with_tm;
     j["auto_relaunch"] = s.auto_relaunch;

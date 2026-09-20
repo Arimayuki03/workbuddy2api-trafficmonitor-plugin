@@ -44,7 +44,7 @@ const wchar_t* CPluginApp::GetInfo(PluginInfoIndex index)
     case TMI_DESCRIPTION: return L"workbuddy2api 服务状态监控与手动控制（loopback 本地接口）";
     case TMI_AUTHOR: return L"Arima";
     case TMI_COPYRIGHT: return L"MIT License";
-    case TMI_VERSION: return L"1.5.0";
+    case TMI_VERSION: return L"1.6.0";
     case TMI_URL: return L"https://github.com/Arimayuki03/workbuddy2api-trafficmonitor-plugin";
     default: return L"";
     }
@@ -68,6 +68,16 @@ const wchar_t* CPluginApp::GetTooltipInfo()
     short_tip = L"WorkBuddy2API";
     return short_tip.c_str();
 #endif
+    // 出口硬上限：MFC UpdateTipText 对 >1024 字符抛 CInvalidArgException（"遇到不适当的
+    // 参数。"），TM 把所有插件的 tooltip 拼成一条，这里无法得知拼接总额，只能保证自己
+    // 永不成为压垮的那段。正常文本经 BuildDisplayLocked 的 kTipBudget(340) 预算已收敛；
+    // 这道闸兜住竞态窗口（设置在两次重建间从折叠切到完整、用户手改 json 等）。1000 留
+    // 出宿主自身文本与其它插件的最低生存空间；硬截在出口完成，无状态、无第二次遍历。
+    constexpr size_t kTipHardCap = 1000;
+    if (t.size() > kTipHardCap) {
+        t.resize(kTipHardCap - 1); // 原地截断（自引用 assign 标准不保证安全）
+        t += L"…";
+    }
     // 乒乓双缓冲：宿主对返回指针无生命周期契约（见 GetCommandName 注释），单缓冲在
     // 下次调用变长时重分配会让宿主正读着的旧指针悬空。交替写 buf_[0]/[1]，任一次
     // 返回的指针到"再下一次调用"前不被改写，宿主有整帧时间完成拷贝。

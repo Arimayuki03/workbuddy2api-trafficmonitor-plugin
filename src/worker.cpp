@@ -12,6 +12,7 @@
 #include "settings.h"
 #include <nlohmann/json.hpp>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <cmath>
 #include <cstdlib>  // std::llabs（自愈校验用；别依赖 json.hpp 传递包含）
@@ -363,10 +364,14 @@ void Worker::PollOnce()
                         ai.credits = JInt(a, "credits");
                         ai.cooling = JBool(a, "cooling");
                         ai.disabled = JBool(a, "disabled");
+                        // 运维手动停用位（上游 a20d06f）：与自动禁用并列独立，叠加态分别透出。
+                        ai.manual_disabled = JBool(a, "manual_disabled");
                         ai.until = RfcToUnix(JStr(a, "until"));
                         ai.reason = Utf8ToWide(JStr(a, "reason"));
                         if (ai.disabled && ai.reason.empty())
                             ai.reason = Utf8ToWide(JStr(a, "disabled_reason"));
+                        // 手动停用原因独立于自动禁用原因：两位叠加时各自显示，不合并。
+                        ai.manual_reason = Utf8ToWide(JStr(a, "manual_reason"));
                         // 三合一冷却的另外两翼：熔断与连败降权（上游 #114）。
                         // 服务端 Cooling=true 时可能是三者任一，恢复时刻展示取最远。
                         ai.breaker_until = RfcToUnix(JStr(a, "breaker_until"));
@@ -629,6 +634,12 @@ void Worker::BuildDisplayLocked()
         if (sn.in_flight_full > 0)
             cnt += WideFormat(L" · 在途满载 %d", sn.in_flight_full);
         lines.push_back(cnt);
+        // 手动停用计数（上游 a20d06f）：服务端把 manual_disabled 也计入 disabled 总数，
+        // 这里从 accounts 侧拆出"其中手动停用 N 个"，两种停用一眼可分。
+        int manual = 0;
+        if (sn.accounts_valid)
+            for (auto& a : sn.accounts) if (a.manual_disabled) manual++;
+        if (manual > 0) lines.push_back(WideFormat(L"其中手动停用 %d 个（右键账户行可恢复）", manual));
     }
     if (!sn.last_error.empty()) lines.push_back(L"提示：" + sn.last_error);
 
@@ -638,7 +649,9 @@ void Worker::BuildDisplayLocked()
         for (auto& a : sn.accounts) {
             if (shown++ >= 8) { lines.push_back(L"…"); break; }
             std::wstring note;
-            if (a.disabled) note = L"已禁用";
+            if (a.disabled && a.manual_disabled) note = L"禁用+停用";
+            else if (a.manual_disabled) note = a.manual_reason.empty() ? L"已停用" : L"已停用(" + a.manual_reason + L")";
+            else if (a.disabled) note = L"已禁用";
             else if (a.cooling) note = L"冷却中";
             else if (a.in_flight > 0) note = L"请求中";
             else note = L"正常";
@@ -1030,6 +1043,69 @@ bool Worker::RequestRefreshCredits()
         }
         if (!note.empty()) Update([&](Snapshot& sn) { NoteLocked(sn, note); });
         EndAct("credits");
+        RefreshSoon();
+    }).detach();
+    return true;
+}
+
+// 账号手动停用/恢复（上游 a20d06f，POST /admin/accounts/{uid}/{op}）。
+// disable=摘出选号池（独立 manual_disabled 位，签到/保活/排程照常）；
+// enable=解手动位；revive=解自动禁用位（disabled）；两位都清账号才回池。
+// 响应回显操作后双位状态（uid/manual_disabled/disabled/changed），端点幂等：
+// 重复调用只更新原因，不报错。busy 键 "acct:<uid>"：同号互斥，不同号并行。
+bool Worker::RequestAccountOp(const std::string& uid, const char* op)
+{
+    if (uid.empty()) return false;
+    const std::string key = "acct:" + uid;
+    if (!BeginAct(key)) return false;
+    std::thread([this, uid, op, key] {
+        if (stop_.load()) { EndAct(key); return; }
+        Settings s = SettingsStore::Instance().Get();
+        std::string bearer = SettingsStore::Instance().CurrentApiKey();
+        std::wstring url = WideFormat(L"http://127.0.0.1:%d/admin/accounts/%s/%s",
+            s.port, Utf8ToWide(uid).c_str(), Utf8ToWide(op).c_str());
+        // 空体即可（服务端 reason 可选）；4 秒：loopback 内存操作，纯防卡死。
+        HttpResponse r = HttpJson(L"POST", url, bearer, "{}", 4000);
+        if (stop_.load()) { EndAct(key); return; }
+        const wchar_t* opzh = std::strcmp(op, "disable") == 0 ? L"停用"
+            : std::strcmp(op, "enable") == 0 ? L"恢复" : L"复活";
+        std::wstring note;
+        if (r.status == 200) {
+            json j;
+            try { j = json::parse(r.body); } catch (...) {}
+            // 拿回显的双位状态直接定位该号：多数场景下下一轮 /status 也会带回同值，
+            // 这里先写一次让 UI 立即反映（服务端口径：changed=false 也算成功）。
+            bool md = JBool(j, "manual_disabled");
+            bool da = JBool(j, "disabled");
+            std::string mr = JStr(j, "manual_reason");
+            Update([&](Snapshot& sn) {
+                for (auto& a : sn.accounts) {
+                    if (a.uid != uid) continue;
+                    a.manual_disabled = md;
+                    a.disabled = da;
+                    if (md) a.manual_reason = Utf8ToWide(mr);
+                }
+                NoteLocked(sn, WideFormat(L"账号已%s（手动停用=%s 自动禁用=%s）", opzh,
+                    md ? L"是" : L"否", da ? L"是" : L"否"));
+            });
+        } else if (r.status == 404) {
+            // 两种可能：admin 未启用（路由整体不注册，纯文本 404）或 uid 不存在
+            //（JSON 信封 not_found）。信封带 error.message，区分提示。
+            json j;
+            try { j = json::parse(r.body); } catch (...) {}
+            std::wstring msg;
+            if (j.contains("error") && j["error"].is_object())
+                msg = Utf8ToWide(JStr(j["error"], "message"));
+            note = msg.empty()
+                ? L"/admin/accounts 不可用（admin 未启用或 wb2api 版本过旧）"
+                : L"操作失败：" + msg;
+        } else if (r.status == 401) {
+            note = L"api_key 不符（401）";
+        } else {
+            note = r.err.empty() ? WideFormat(L"操作失败（HTTP %lu）", r.status) : r.err;
+        }
+        if (!note.empty()) Update([&](Snapshot& sn) { NoteLocked(sn, note); });
+        EndAct(key);
         RefreshSoon();
     }).detach();
     return true;

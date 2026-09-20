@@ -39,7 +39,13 @@ struct AccountInfo {
     // degrade_until（连败降权，上游 #114）任一未到期即为 true。恢复时刻展示取三者最远。
     bool cooling = false;
     bool disabled = false;
+    // 运维手动停用（上游 a20d06f，/status accounts[].manual_disabled）：与自动禁用
+    // disabled **并列独立**的两位。语义="对话流量摘除"——签到/保活/排程照常、账号仍在
+    // 池里，只是不参与选号；恢复用 enable（解手动位），自动禁用才用 revive（解自动位）。
+    // 服务端计数口径把两者都归 disabled 总数。
+    bool manual_disabled = false;
     std::wstring reason;
+    std::wstring manual_reason; // 仅手动停用：停用原因（运维可见，服务端 manual_reason）
     int64_t until = 0;            // 账号级冷却至（unix 秒；0=无）
     int64_t breaker_until = 0;    // 熔断截止（0=无）
     int64_t degrade_until = 0;    // 连败降权截止（0=无）

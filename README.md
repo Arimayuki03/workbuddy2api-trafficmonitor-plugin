@@ -17,9 +17,12 @@
 ## 前置条件（重要）
 
 **本插件必须配合 [Arimayuki03/workbuddy2api](https://github.com/Arimayuki03/workbuddy2api) 使用**
-——`/admin` 管理接口（任务开关/立即执行/实时积分/积分冷却热改）是该 fork 独有的，
+——`/admin` 管理接口（任务开关/立即执行/实时积分/积分冷却热改/账号停用恢复）是该 fork 独有的，
 官方上游 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 没有这些接口，
 插件的"定时任务/实时积分"页会提示不可用，只能看服务状态与账户估算积分。
+
+> 插件 v1.4.0 的账号停用/恢复功能需要服务端 ≥ **2026-09-20 合并版**（含上游 `a20d06f`
+> 账号临时停用端点与 `/status` 的 `manual_disabled` 双位状态）；旧版服务端其余功能不受影响。
 
 启用完整功能需在 workbuddy2api 的 `config.json` 增加并重启一次服务：
 
@@ -63,6 +66,11 @@ powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1 -TMDir 'E:\软件\Tr
 - **成本台账**：设置窗页②**双击账户行**，弹出该号每模型实测成本（模型｜每1k均价｜样本｜末次观测）。
   每1k=实测千 token 均价（EMA，≤0 即实测免费），6 小时无观测服务端自动回收；
   服务端选号按便宜优先，台账解释"为什么总选它"。口径同 wb2api 的 `status-report.ps1`。
+- **账号停用/恢复**（需服务端 ≥ 2026-09-20 版本，`admin.enabled`）：页②**右键账户行**——
+  「停用」把该号手动摘出选号池（独立 `manual_disabled` 位，签到/保活/排程照常，纯对话流量摘除）；
+  「恢复」解除手动停用；「复活」解除系统自动禁用（仅自动禁用的账号出现）。
+  状态列区分 **手动停用 / 自动禁用** 双位（叠加时显示"手动+自动"），tooltip 禁用计数里
+  拆出"其中手动停用 N 个"。两位各自清除、都清空才回到选号池；停用状态服务端落盘，重启保留。
 
 ## 界面预览
 
@@ -122,6 +130,9 @@ powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1 -TMDir 'E:\软件\Tr
 ## 已知边界
 
 - 只监控/控制 **本机回环**上的 wb2api（`/admin` 拒绝非 loopback 来源）。
+- 账号"停用/恢复/复活"走服务端内存操作（幂等，重复点击不报错）；对**旧版 wb2api**（无
+  `/admin/accounts/*` 端点）会提示不可用，不影响其他功能。停用是独立状态位，与签到解冻、
+  冷却到期等自动复活路径互不干扰。
 - 插件更新后「插件管理→重新加载」**不会**加载新代码（worker 线程钉住 DLL 映像，重载静默失效），
   改配置/换 DLL 后请**重启 TM**；部署脚本已做改名式替换，见"部署"一节。
 - 诊断开关：设环境变量 `WB2API_TRACE=1` 后启动 TM，插件会记录接口调用时序，并把 first-chance

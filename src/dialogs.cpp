@@ -23,9 +23,13 @@
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <uxtheme.h>
+#include <windowsx.h>   // GET_X_LPARAM/GET_Y_LPARAM（账户行右键定位）
 #include <ctime>
 #include <algorithm>
 #include <vector>
+
+// 应用私有消息：把"查看成本台账"从 WM_NOTIFY 与右键菜单两处入口收敛到一个处理点。
+#define WB_APP_SHOWCOSTS (WM_APP + 0x21)
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "uxtheme.lib")
@@ -253,7 +257,12 @@ void FillAccountList(Ctx& c, const Snapshot& sn)
         }
         setcol(3, livev);
         std::wstring st;
-        if (a.disabled) st = a.reason.empty() ? L"已禁用" : L"已禁用 " + a.reason;
+        // 双位状态（上游 a20d06f）：disabled=系统自动禁用（可 revive 复活）；
+        // manual_disabled=运维手动停用（可 enable 恢复）；叠加态分别展示不合并。
+        if (a.manual_disabled || a.disabled) st = L"停用";
+        if (a.manual_disabled && a.disabled) st += L"(手动+自动)";
+        else if (a.manual_disabled) st = a.manual_reason.empty() ? L"手动停用" : L"手动停用 " + a.manual_reason;
+        else if (a.disabled) st = a.reason.empty() ? L"自动禁用" : L"自动禁用 " + a.reason;
         else if (a.cooling) {
             // 服务端 cooling 是三合一口径（冷却/熔断/连败降权任一未到期）。按"哪一翼
             // 撑到最远"细分标注，降权再带上连败计数（阈值 5 次，见服务端 degrade_threshold）。
@@ -366,7 +375,9 @@ void Refresh(Ctx& c)
             std::to_wstring(a.credits) + L"|" + std::to_wstring(a.in_flight) + L"|" +
             std::to_wstring(a.until) + L"|" + std::to_wstring(a.breaker_until) + L"|" +
             std::to_wstring(a.degrade_until) + L"|" + std::to_wstring(a.consec_fails) + L"|" +
-            std::to_wstring(a.rl_models) + L"|" + std::to_wstring(a.token_expiry) + L";";
+            std::to_wstring(a.rl_models) + L"|" + std::to_wstring(a.token_expiry) + L"|" +
+            (a.disabled ? L"1" : L"0") + (a.manual_disabled ? L"1" : L"0") +
+            a.reason + L"|" + a.manual_reason + L";";
     }
     for (auto& r : sn.credits.rows) {
         hash_in += r.uid8 + L"|" + std::to_wstring(r.remain) + L"|" +
@@ -533,6 +544,10 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             8, 206, 404, 10, 1);
         MkHint(*cp, L"插件只按服务端允许的节奏查询，不会触发 429；双击账户行可看该号每模型实测成本台账。",
             8, 218, 404, 10, 1);
+        MkHint(*cp, L"右键账户行可停用/恢复选号（需 admin.enabled）：停用=手动摘出选号池（签到/保活照常），",
+            8, 230, 404, 10, 1);
+        MkHint(*cp, L"恢复=解除手动停用；「复活」仅对系统自动禁用的账号可用。状态列区分 手动停用/自动禁用 双位。",
+            8, 242, 404, 10, 1);
 
         // —— 页③ 定时任务 ——
         // 表头一行 + 每任务一行：勾选 | 触发时间(可编辑) | 下次 | 上次/状态 | 立即执行 | 应用。
@@ -611,34 +626,85 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             ShowPage(*cp, static_cast<int>(TabCtrl_GetCurSel(cp->tab)));
             return TRUE;
         }
+        // 右键账户行 → 账号运维菜单（上游 a20d06f /admin/accounts/{uid}/…）：
+        // 停用=摘出选号池（manual_disabled 位，签到/保活照常）；恢复=解手动位；
+        // 复活=解系统自动禁用位（disabled）。按该号当前双位状态裁剪可用项。
+        if (cp->acc_list && nh->hwndFrom == cp->acc_list && nh->code == NM_RCLICK) {
+            DWORD pos = GetMessagePos();
+            POINT pt{ GET_X_LPARAM(pos), GET_Y_LPARAM(pos) };
+            LVHITTESTINFO ht{};
+            ht.pt = pt;
+            ScreenToClient(cp->acc_list, &ht.pt);
+            int idx = ListView_HitTest(cp->acc_list, &ht);
+            Snapshot sn = Worker::Instance().Copy();
+            if (idx < 0 || idx >= (int)sn.accounts.size()) return TRUE;
+            const AccountInfo& a = sn.accounts[idx];
+            HMENU m = CreatePopupMenu();
+            // admin 不可用（/admin 未启用或版本过旧）时操作项置灰——端点根本不存在，
+            // 点了也只会得到 404 提示；台账查看不依赖 admin，保持可用。
+            UINT opflag = sn.admin_available ? MF_STRING : MF_STRING | MF_GRAYED;
+            // 停用/恢复互斥显示；复活只在系统自动禁用时可用（enable/revive 各清各的位）。
+            if (a.manual_disabled)
+                AppendMenuW(m, opflag, 2, L"恢复选号（解手动停用）");
+            else
+                AppendMenuW(m, opflag, 1, L"停用（摘出选号池）");
+            if (a.disabled)
+                AppendMenuW(m, opflag, 3, L"复活（解自动禁用）");
+            AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(m, MF_STRING, 9, L"查看成本台账");
+            int cmd = TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                pt.x, pt.y, 0, hDlg, nullptr);
+            DestroyMenu(m);
+            const std::string uid = a.uid;
+            switch (cmd) {
+            case 1: case 2:
+                if (sn.admin_available)
+                    Worker::Instance().RequestAccountOp(uid, cmd == 1 ? "disable" : "enable");
+                break;
+            case 3:
+                if (sn.admin_available)
+                    Worker::Instance().RequestAccountOp(uid, "revive");
+                break;
+            case 9:
+                SendMessageW(hDlg, WB_APP_SHOWCOSTS, 0, (LPARAM)idx);
+                break;
+            default: break;
+            }
+            return TRUE;
+        }
         // 双击（或回车）账户行 → 该号每模型实测成本台账（/status accounts[].model_costs，
         // wb2api 上游 2493532 透出）。口径与 wb2api 的 status-report.ps1 一致：
         // 每1k=实测千 token 均价（EMA，≤0 即实测免费），6 小时无观测服务端自动删行。
         if (cp->acc_list && nh->hwndFrom == cp->acc_list && nh->code == LVN_ITEMACTIVATE) {
-            int idx = (int)ListView_GetNextItem(cp->acc_list, -1, LVNI_SELECTED);
-            Snapshot sn = Worker::Instance().Copy();
-            if (idx < 0 || idx >= (int)sn.accounts.size()) return TRUE;
-            const AccountInfo& a = sn.accounts[idx];
-            std::wstring box = a.nickname + L"（" + (a.realm.empty() ? L"cn" : a.realm) +
-                L"）每模型实测成本\n\n";
-            if (a.costs.empty()) {
-                box += L"（暂无观测：该号还没处理过可记账的请求，或观测已过 6 小时被服务端回收）";
-            } else {
-                box += L"模型｜每1k均价｜样本｜末次观测\n";
-                for (auto& m : a.costs) {
-                    // 3 位小数（同 status-report.ps1 的 N3 口径）：实测单价常见 0.00x 量级，
-                    // 2 位会把 0.0034 显示成 "0.00"，与"免费"混淆。
-                    box += WideFormat(L"%s｜%s｜%d｜%s\n", m.model.c_str(),
-                        m.per1k <= 0 ? L"免费" : WideFormat(L"%.3f", m.per1k).c_str(),
-                        m.samples,
-                        m.last_seen ? FormatTimeShort(m.last_seen).c_str() : L"-");
-                }
-                box += L"\n选号按便宜优先；≤0=实测免费，数字为积分/千 token。";
-            }
-            MessageBoxW(hDlg, box.c_str(), L"成本台账", MB_OK);
+            SendMessageW(hDlg, WB_APP_SHOWCOSTS, 0, (LPARAM)ListView_GetNextItem(cp->acc_list, -1, LVNI_SELECTED));
             return TRUE;
         }
         return FALSE;
+    }
+    case WB_APP_SHOWCOSTS: {
+        if (!cp) return TRUE;
+        int idx = (int)lp;
+        Snapshot sn = Worker::Instance().Copy();
+        if (idx < 0 || idx >= (int)sn.accounts.size()) return TRUE;
+        const AccountInfo& a = sn.accounts[idx];
+        std::wstring box = a.nickname + L"（" + (a.realm.empty() ? L"cn" : a.realm) +
+            L"）每模型实测成本\n\n";
+        if (a.costs.empty()) {
+            box += L"（暂无观测：该号还没处理过可记账的请求，或观测已过 6 小时被服务端回收）";
+        } else {
+            box += L"模型｜每1k均价｜样本｜末次观测\n";
+            for (auto& m : a.costs) {
+                // 3 位小数（同 status-report.ps1 的 N3 口径）：实测单价常见 0.00x 量级，
+                // 2 位会把 0.0034 显示成 "0.00"，与"免费"混淆。
+                box += WideFormat(L"%s｜%s｜%d｜%s\n", m.model.c_str(),
+                    m.per1k <= 0 ? L"免费" : WideFormat(L"%.3f", m.per1k).c_str(),
+                    m.samples,
+                    m.last_seen ? FormatTimeShort(m.last_seen).c_str() : L"-");
+            }
+            box += L"\n选号按便宜优先；≤0=实测免费，数字为积分/千 token。";
+        }
+        MessageBoxW(hDlg, box.c_str(), L"成本台账", MB_OK);
+        return TRUE;
     }
     case WM_COMMAND: {
         if (!cp) return FALSE;

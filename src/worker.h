@@ -42,8 +42,9 @@ public:
     bool RequestRefreshCredits();
     // 账号手动停用/恢复（上游 a20d06f 端点）：op ∈ "disable"|"enable"|"revive"。
     // disable=摘出选号池（签到/保活照常）；enable=解手动位；revive=解自动禁用位。
-    // busy 键 "acct:<uid>"：同号操作互斥，不同号可并行。
-    bool RequestAccountOp(const std::string& uid, const char* op);
+    // busy 键 "acct:<uid>"：同号操作互斥，不同号可并行。op 按 std::string 值捕获进
+    // detached 线程，调用方无需保证实参生命周期。
+    bool RequestAccountOp(const std::string& uid, const std::string& op);
     bool IsActionBusy(const std::string& key) const;         // "svc"/"credits"/"task:<kind>"/"acct:<uid>"
     // 把实时积分自动刷新周期异步同步到服务端冷却（PATCH /admin/credits-interval，
     // 热生效+写回服务 config.json；服务端区间 60–86400 秒）。动作线程内执行，结果经

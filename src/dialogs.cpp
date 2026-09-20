@@ -259,8 +259,9 @@ void FillAccountList(Ctx& c, const Snapshot& sn)
         std::wstring st;
         // 双位状态（上游 a20d06f）：disabled=系统自动禁用（可 revive 复活）；
         // manual_disabled=运维手动停用（可 enable 恢复）；叠加态分别展示不合并。
-        if (a.manual_disabled || a.disabled) st = L"停用";
-        if (a.manual_disabled && a.disabled) st += L"(手动+自动)";
+        if (a.manual_disabled && a.disabled)
+            st = L"停用(手动" + (a.manual_reason.empty() ? L"" : L":" + a.manual_reason) +
+                 L"+自动" + (a.reason.empty() ? L"" : L":" + a.reason) + L")";
         else if (a.manual_disabled) st = a.manual_reason.empty() ? L"手动停用" : L"手动停用 " + a.manual_reason;
         else if (a.disabled) st = a.reason.empty() ? L"自动禁用" : L"自动禁用 " + a.reason;
         else if (a.cooling) {
@@ -640,6 +641,7 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             if (idx < 0 || idx >= (int)sn.accounts.size()) return TRUE;
             const AccountInfo& a = sn.accounts[idx];
             HMENU m = CreatePopupMenu();
+            if (!m) return TRUE;
             // admin 不可用（/admin 未启用或版本过旧）时操作项置灰——端点根本不存在，
             // 点了也只会得到 404 提示；台账查看不依赖 admin，保持可用。
             UINT opflag = sn.admin_available ? MF_STRING : MF_STRING | MF_GRAYED;
@@ -655,7 +657,7 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             int cmd = TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
                 pt.x, pt.y, 0, hDlg, nullptr);
             DestroyMenu(m);
-            const std::string uid = a.uid;
+            const std::string& uid = a.uid;
             switch (cmd) {
             case 1: case 2:
                 if (sn.admin_available)

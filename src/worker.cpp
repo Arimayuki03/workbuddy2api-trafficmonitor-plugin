@@ -1053,7 +1053,7 @@ bool Worker::RequestRefreshCredits()
 // enable=解手动位；revive=解自动禁用位（disabled）；两位都清账号才回池。
 // 响应回显操作后双位状态（uid/manual_disabled/disabled/changed），端点幂等：
 // 重复调用只更新原因，不报错。busy 键 "acct:<uid>"：同号互斥，不同号并行。
-bool Worker::RequestAccountOp(const std::string& uid, const char* op)
+bool Worker::RequestAccountOp(const std::string& uid, const std::string& op)
 {
     if (uid.empty()) return false;
     const std::string key = "acct:" + uid;
@@ -1067,27 +1067,37 @@ bool Worker::RequestAccountOp(const std::string& uid, const char* op)
         // 空体即可（服务端 reason 可选）；4 秒：loopback 内存操作，纯防卡死。
         HttpResponse r = HttpJson(L"POST", url, bearer, "{}", 4000);
         if (stop_.load()) { EndAct(key); return; }
-        const wchar_t* opzh = std::strcmp(op, "disable") == 0 ? L"停用"
-            : std::strcmp(op, "enable") == 0 ? L"恢复" : L"复活";
+        const wchar_t* opzh = op == "disable" ? L"停用"
+            : op == "enable" ? L"恢复" : L"复活";
         std::wstring note;
         if (r.status == 200) {
             json j;
-            try { j = json::parse(r.body); } catch (...) {}
-            // 拿回显的双位状态直接定位该号：多数场景下下一轮 /status 也会带回同值，
-            // 这里先写一次让 UI 立即反映（服务端口径：changed=false 也算成功）。
-            bool md = JBool(j, "manual_disabled");
-            bool da = JBool(j, "disabled");
-            std::string mr = JStr(j, "manual_reason");
-            Update([&](Snapshot& sn) {
-                for (auto& a : sn.accounts) {
-                    if (a.uid != uid) continue;
-                    a.manual_disabled = md;
-                    a.disabled = da;
-                    if (md) a.manual_reason = Utf8ToWide(mr);
-                }
-                NoteLocked(sn, WideFormat(L"账号已%s（手动停用=%s 自动禁用=%s）", opzh,
-                    md ? L"是" : L"否", da ? L"是" : L"否"));
-            });
+            bool parsed = true;
+            try { j = json::parse(r.body); } catch (...) { parsed = false; }
+            // 200 但响应体不是 JSON（协议回归）时绝不写回：默认构造的 json 会让
+            // JBool 全取 false，账号会被误标为"已恢复"，只能提示等下轮 /status 纠正。
+            if (parsed) {
+                // 拿回显的双位状态直接定位该号：多数场景下下一轮 /status 也会带回同值，
+                // 这里先写一次让 UI 立即反映（服务端口径：changed=false 也算成功）。
+                bool md = JBool(j, "manual_disabled");
+                bool da = JBool(j, "disabled");
+                std::string mr = JStr(j, "manual_reason");
+                Update([&](Snapshot& sn) {
+                    for (auto& a : sn.accounts) {
+                        if (a.uid != uid) continue;
+                        a.manual_disabled = md;
+                        a.disabled = da;
+                        // 手动位与原因成对维护：解手动位时同步清原因，避免快照残留
+                        // 旧原因文本（UI 虽有 manual_disabled 守卫，防御性清干净）。
+                        if (md) a.manual_reason = Utf8ToWide(mr);
+                        else a.manual_reason.clear();
+                    }
+                    NoteLocked(sn, WideFormat(L"账号已%s（手动停用=%s 自动禁用=%s）", opzh,
+                        md ? L"是" : L"否", da ? L"是" : L"否"));
+                });
+            } else {
+                note = L"操作成功但响应解析失败（协议异常），等待下轮状态刷新";
+            }
         } else if (r.status == 404) {
             // 两种可能：admin 未启用（路由整体不注册，纯文本 404）或 uid 不存在
             //（JSON 信封 not_found）。信封带 error.message，区分提示。

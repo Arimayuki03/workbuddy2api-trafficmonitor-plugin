@@ -168,9 +168,13 @@ int64_t NowSec() { return static_cast<int64_t>(time(nullptr)); }
 
 std::wstring KindLabel(const std::string& kind)
 {
+    // 与 wb2api 合并版 kindNames 对齐（checkin/travel/activity/keepalive/school/cat/queue）。
+    // queue=任务中心执行队列的定时排程（网页端任务中心「启动执行队列」的定时版），
+    // 服务端 queue_enabled 缺省 false。
     static const std::map<std::string, std::wstring> m = {
         { "checkin", L"签到" }, { "travel", L"猫猫旅行" }, { "activity", L"活跃上报" },
         { "keepalive", L"Token 保活" }, { "school", L"开学季" }, { "cat", L"夜猫子" },
+        { "queue", L"任务队列" },
     };
     auto it = m.find(kind);
     return it == m.end() ? Utf8ToWide(kind) : it->second;
@@ -516,6 +520,9 @@ void Worker::PollOnce()
         }
     }
 
+    // 整表替换后立刻用 token_expiry_ 缓存回填令牌到期：/status 不带该字段，新解析
+    // 的 token_expiry 恒 0；若只等下一轮 ScanAuthExpiry（5 分钟一次），令牌列每个
+    // 轮询周期都会闪回 "-"（用户可见的空白 bug）。缓存 miss 保持 0=未知。
     Update([&](Snapshot& sn) {
         if (patch.state != SvcState::Unknown) sn.state = patch.state;
         sn.last_error = patch.last_error;
@@ -524,7 +531,13 @@ void Worker::PollOnce()
             sn.total = patch.total; sn.healthy = patch.healthy;
             sn.cooling = patch.cooling; sn.disabled_n = patch.disabled_n; sn.sticky = patch.sticky;
             sn.in_flight_full = patch.in_flight_full;
-            if (patch.accounts_valid) { sn.accounts = std::move(patch.accounts); sn.accounts_valid = true; }
+            if (patch.accounts_valid) {
+                sn.accounts = std::move(patch.accounts); sn.accounts_valid = true;
+                for (auto& a : sn.accounts) {
+                    auto it = token_expiry_.find(a.uid);
+                    if (it != token_expiry_.end()) a.token_expiry = it->second;
+                }
+            }
             sn.last_ok_ts = (int64_t)time(nullptr);
         }
     });

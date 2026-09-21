@@ -45,9 +45,12 @@ extern HMODULE g_hInst; // 资源所在模块（DllMain 赋值）
 namespace wb2::dlg {
 namespace {
 
-constexpr int KIND_N = 6;
-const char* kKinds[KIND_N] = { "checkin", "travel", "activity", "keepalive", "school", "cat" };
-const wchar_t* kKindZh[KIND_N] = { L"签到", L"猫猫旅行", L"活跃上报", L"Token保活", L"开学季", L"夜猫子" };
+// 7 类任务（wb2api 合并版 /admin/tasks）：queue=任务中心执行队列的定时排程，
+// 服务端 queue_enabled 缺省 false（队列对全账号执行真实任务动作链、消耗上游配额，
+// 网页端同为 opt-in），勾选态以服务端快照为准。
+constexpr int KIND_N = 7;
+const char* kKinds[KIND_N] = { "checkin", "travel", "activity", "keepalive", "school", "cat", "queue" };
+const wchar_t* kKindZh[KIND_N] = { L"签到", L"猫猫旅行", L"活跃上报", L"Token保活", L"开学季", L"夜猫子", L"任务队列" };
 
 // 账户表列序（v1.7.0 起 7 列）：昵称|域|估算|实时|状态|悬浮窗|令牌剩。
 // "悬浮窗"列与"令牌剩"列的下标：FillAccountList 的 setcol 与建表列序（DlgProc 里
@@ -637,6 +640,7 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         // 状态列加宽到 172 并把"应用"压到 x=414：旧布局 150 宽度装不下长结果
         // （"ok=0 already=4 fail=0 skipped=0"约 40 字符）被截换行，视觉上像被下一行遮挡。
         // 页面可用宽度 ≈472 DLU（对话框 500 减边框/tab 边距），列宽合计 8+70+44+8+40+8+172+8+44+8+40 ≈ 458。
+        // v1.8.0 加第 7 行 queue（任务队列）：行距 26 不变，全部执行/提示整体下移一行。
         const struct { LPCWSTR t; int x; int w; } hdr[] = {
             { L"任务", 10, 64 }, { L"触发时间(点)", 82, 46 }, { L"下次", 150, 40 },
             { L"状态(上次结果)", 194, 176 }, { L"", 374, 44 }, { L"", 420, 40 },
@@ -653,11 +657,14 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             cp->task[i].btn = MkBtn(*cp, L"立即执行", 374, y - 2, 44, 14, IDC_TASK_BASE + i * 10 + 5, 2);
             cp->task[i].apply = MkBtn(*cp, L"应用", 420, y - 2, 40, 14, IDC_TASK_BASE + i * 10 + 7, 2);
         }
-        cp->btn_runall = MkBtn(*cp, L"全部执行", 8, 202, 60, 14, IDC_BTN_RUNALL, 2);
-        cp->task_note = MkLabel(*cp, L"", 76, 204, 390, 10, 2);
+        cp->btn_runall = MkBtn(*cp, L"全部执行", 8, 228, 60, 14, IDC_BTN_RUNALL, 2);
+        cp->task_note = MkLabel(*cp, L"", 76, 230, 390, 10, 2);
         MkHint(*cp, L"触发时间=24 小时制小时列表（逗号分隔，如 9,21）；「应用」写回服务 config.json，重启服务后生效。",
-            8, 220, 404, 10, 2);
-        MkHint(*cp, L"立即执行在服务进程内跑（与定时任务同一把锁）；状态列显示上次执行结果与耗时。", 8, 232, 404, 10, 2);
+            8, 246, 404, 10, 2);
+        MkHint(*cp, L"立即执行在服务进程内跑（与定时任务同一把锁）；状态列显示上次执行结果与耗时。", 8, 258, 404, 10, 2);
+        MkHint(*cp, L"任务队列=扫描全账号待办（成长任务+开学季）并排队执行，消耗上游配额；定时排程默认关，",
+            8, 270, 404, 10, 2);
+        MkHint(*cp, L"需勾选启用（同网页端任务中心 opt-in 口径）；「立即执行」不等排程、随时可跑一次。", 8, 282, 404, 10, 2);
 
         // —— 页④ 显示 ——
         cp->rad[0] = MkWnd(*cp, L"BUTTON", L"状态 + 账号数（如 4/4）", BS_AUTORADIOBUTTON | WS_TABSTOP, 0, 8, 8, 220, 10, IDC_RAD_ACCOUNT, 3);

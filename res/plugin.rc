@@ -8,12 +8,13 @@
 // 对话框：仅 Tab + 保存/关闭；标签页内容由 DlgProc 动态生成
 // v1.1 加宽加高：定时任务页放 6 列（状态列完整显示执行结果不截行）、
 // 账户页实时列扩为"剩余（已用/总量）"。模板尺寸与 dialogs.cpp 的 DLU 布局联动。
-IDD_SETTINGS DIALOGEX 0, 0, 500, 314
+// v1.8.0 定时任务页加第 7 行（任务队列）+ 说明两行：高度 314→340。
+IDD_SETTINGS DIALOGEX 0, 0, 500, 340
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "WorkBuddy2API 插件设置"
 FONT 9, "Microsoft YaHei UI", 400, 0, 1
 BEGIN
-    CONTROL "", IDC_TAB, "SysTabControl32", TCS_TABS | WS_CHILD | WS_VISIBLE | WS_TABSTOP, 7, 7, 486, 272
-    DEFPUSHBUTTON "保存(&S)", IDOK, 347, 292, 70, 16
-    PUSHBUTTON "关闭", IDCANCEL, 423, 292, 70, 16
+    CONTROL "", IDC_TAB, "SysTabControl32", TCS_TABS | WS_CHILD | WS_VISIBLE | WS_TABSTOP, 7, 7, 486, 298
+    DEFPUSHBUTTON "保存(&S)", IDOK, 347, 318, 70, 16
+    PUSHBUTTON "关闭", IDCANCEL, 423, 318, 70, 16
 END

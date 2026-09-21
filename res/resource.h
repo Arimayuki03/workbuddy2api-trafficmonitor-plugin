@@ -36,6 +36,7 @@
 #define IDC_CHK_LIVECRD         1303
 #define IDC_CHK_TIPFULL         1305
 #define IDC_CHK_TIPACC          1306
+#define IDC_CHK_TIPTASKS        1307
 
 // ⑤ 高级
 #define IDC_EDT_ADMIN           1400

@@ -43,12 +43,15 @@ struct RlModel {
 
 // 按模型用量统计行（wb2api GET /v1/stats models[]，进程内存聚合、重启清零）：
 // credit=该模型累计消耗积分（上游 usage.credit 之和）；credit_per_req=单次均值。
+// ratio=上游积分倍率原文（如 "x0.06"，上游 5009a1f 与 /v1/models 同源合入；
+// 目录未下发/缓存冷时为空串——缺失≠免费，显示侧整体省略不补 "x0.00"）。
 struct ModelUsage {
     std::wstring model;
     int64_t requests = 0;
     double credit = 0;
     double credit_per_req = 0;
     int64_t total_tokens = 0;
+    std::wstring ratio;
 };
 
 struct AccountInfo {

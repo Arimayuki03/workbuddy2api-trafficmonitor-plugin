@@ -49,7 +49,22 @@ constexpr int KIND_N = 6;
 const char* kKinds[KIND_N] = { "checkin", "travel", "activity", "keepalive", "school", "cat" };
 const wchar_t* kKindZh[KIND_N] = { L"签到", L"猫猫旅行", L"活跃上报", L"Token保活", L"开学季", L"夜猫子" };
 
+// 账户表列序（v1.7.0 起 7 列）：昵称|域|估算|实时|状态|悬浮窗|令牌剩。
+// "悬浮窗"列与"令牌剩"列的下标：FillAccountList 的 setcol 与建表列序（DlgProc 里
+// cols[]）共用这一份定义，加/删列时改这里即可，写单元格与建表不会错位。
+constexpr int kTipCol = 5;
+constexpr int kTokenCol = 6;
+constexpr int kAccCols = 7;
+
 int64_t NowSecX() { return static_cast<int64_t>(time(nullptr)); }
+
+// 该号当前是否出现在悬浮提示账户明细里（tip_hidden_uids 反相）。
+// FillAccountList 的"是/否"列与 Refresh 的行哈希（T/F）共用这一份判断，
+// 两处显隐口径永不发散。
+bool IsTipHidden(const std::vector<std::wstring>& hidden, const std::wstring& uid8)
+{
+    return std::find(hidden.begin(), hidden.end(), uid8) != hidden.end();
+}
 
 bool SettingsEqual(const Settings& a, const Settings& b)
 {
@@ -60,6 +75,7 @@ bool SettingsEqual(const Settings& a, const Settings& b)
         a.show_mode == b.show_mode && a.show_live_credits == b.show_live_credits &&
         a.tooltip_full == b.tooltip_full &&
         a.tooltip_accounts == b.tooltip_accounts &&
+        a.tooltip_tasks == b.tooltip_tasks &&
         a.autostart_task == b.autostart_task && a.start_with_tm == b.start_with_tm &&
         a.auto_relaunch == b.auto_relaunch && a.logging == b.logging;
 }
@@ -87,13 +103,18 @@ struct Ctx {
     COLORREF state_color = RGB(120, 120, 120);
     // 页②
     HWND acc_list = nullptr, btn_cred = nullptr, lbl_cool = nullptr, citv_edt = nullptr;
+    // 悬浮提示账户显隐快照（tip_hidden_uids）：Refresh 时从 SettingsStore 拷出，
+    // FillAccountList 回填"悬浮窗"列与行哈希用它——列表重建期间读多遍，避免每遍
+    // 都进 SettingsStore 的锁。
+    std::vector<std::wstring> tip_hidden_now;
     std::wstring acc_hash; // 账户行内容哈希：只有行内容变了才重建列表（旧 sig 含 last_ok_ts，
                            // 每个轮询周期必变，会周期性重置用户正在浏览的滚动位置/选中行）
     // 页③
     TaskRow task[KIND_N];
     HWND task_warn = nullptr, btn_runall = nullptr, task_note = nullptr;
     // 页④
-    HWND rad[3] = {}, chk_live = nullptr, chk_tipfull = nullptr, chk_tipacc = nullptr;
+    HWND rad[3] = {}, chk_live = nullptr, chk_tipfull = nullptr, chk_tipacc = nullptr,
+        chk_tiptasks = nullptr;
     // 页⑤
     HWND admin_edt = nullptr, admin_stat = nullptr;
     // 次要说明文字集合：CTLCOLORSTATIC 里统一画灰
@@ -311,7 +332,11 @@ void FillAccountList(Ctx& c, const Snapshot& sn)
         }
         else st = L"正常";
         setcol(4, st);
-        setcol(5, a.token_expiry > NowSecX()
+        // 悬浮窗列：该号当前是否出现在悬浮提示账户明细里（tip_hidden_uids 反相）。
+        // 与右键菜单"悬浮提示显示此账户"同一份数据，此处提供免菜单的可见性。
+        bool tipshown = !IsTipHidden(c.tip_hidden_now, a.uid8);
+        setcol(kTipCol, tipshown ? L"是" : L"否");
+        setcol(kTokenCol, a.token_expiry > NowSecX()
             ? WideFormat(L"%lld天", (a.token_expiry - NowSecX()) / 86400) : L"-");
     }
 }
@@ -328,21 +353,28 @@ void FitAccountColumnsOnce(Ctx& c)
     GetClientRect(c.acc_list, &rc);
     int total = rc.right - rc.left;
     if (total <= 0) return; // 页②还没显示过：翻到页②时客户区才有宽
-    static const int kDesign[] = { 88, 30, 46, 0, 132, 50 }; // 下标 3 = 实时列（吃余量）
-    const int kFixedDesign = 88 + 30 + 46 + 132 + 50;        // 固定列设计合计 346
-    const int kTotalDesign = kFixedDesign + 120;             // + 实时列设计宽 120 = 466
-    int fixed = kFixedDesign * total / kTotalDesign;
+    // v1.7.0 起第 kTipCol 列为"悬浮窗"（是/否）：56 足够两字 + 表头；令牌剩挪到第 kTokenCol 列。
+    // 下标 3 = 实时列（吃余量，设计宽 0 单独处理）。数组顺序与 kTipCol/kTokenCol/kAccCols
+    // （文件头）及 DlgProc 里 cols[] 建表列序一一对应。
+    static const int kDesign[] = { 88, 28, 42, 0, 126, 56, 48 };
+    constexpr int kCols = sizeof(kDesign) / sizeof(kDesign[0]);
+    static_assert(kCols == kAccCols, "列宽预设与账户表列数不一致");
+    constexpr int kLiveDesign = 120; // 实时列设计宽（吃余量列的配比基数）
+    int fixed_design = 0;
+    for (int w : kDesign) fixed_design += w; // 88+28+42+126+56+48 = 388
+    const int total_design = fixed_design + kLiveDesign; // 508
+    int fixed = fixed_design * total / total_design;
     int live = total - fixed;
     if (live < 60) live = 60; // 极窄窗口下实时列保底可读
     // 累计取整：每列宽 = 缩放后的前缀和差值，整数除法误差不累计，总和恰好填满
     int prefix = 0, prev_end = 0;
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < kCols; i++) {
         int w;
         if (!kDesign[i]) {
             w = live;
         } else {
             prefix += kDesign[i];
-            int end = prefix * fixed / kFixedDesign;
+            int end = prefix * fixed / fixed_design;
             w = end - prev_end;
             prev_end = end;
         }
@@ -398,8 +430,14 @@ void Refresh(Ctx& c)
             sn.credits.total_used >= 0 ? FormatThousands(sn.credits.total_used).c_str() : L"-");
     else cool = L"尚未查询 · 按钮会逐号向服务端发起实时余额查询";
     SetWindowTextW(c.lbl_cool, cool.c_str());
-    // 行内容哈希：纳入决定每一行显示内容的字段（uid/昵称/域/估算/实时列/状态/令牌）。
+    // 行内容哈希：纳入决定每一行显示内容的字段（uid/昵称/域/估算/实时列/状态/悬浮窗/令牌）。
     // 不含 last_ok_ts/credits.ts 这类"每次轮询必变"的时间戳——列表只在内容真变时重建。
+    // tip_hidden_now：本次刷新时刻的显隐快照，悬浮窗列内容随右键菜单操作即时重建
+    // （Modify 保存后 RefreshSoon→下一轮 Copy 带出新值，哈希比对发现变化即重填）。
+    {
+        Settings st_now = SettingsStore::Instance().Get();
+        c.tip_hidden_now = st_now.tip_hidden_uids;
+    }
     std::wstring hash_in;
     for (auto& a : sn.accounts) {
         hash_in += a.uid8 + L"|" + a.nickname + L"|" + a.realm + L"|" +
@@ -409,6 +447,8 @@ void Refresh(Ctx& c)
             std::to_wstring(a.rl_models) + L"|" + std::to_wstring(a.token_expiry) + L"|" +
             (a.disabled ? L"1" : L"0") + L"|" + (a.manual_disabled ? L"1" : L"0") + L"|" +
             a.reason + L"|" + a.manual_reason + L"|";
+        // 悬浮窗显隐进哈希：右键菜单切换后无需等账号数据变化也能触发列表重建
+        hash_in += IsTipHidden(c.tip_hidden_now, a.uid8) ? L"F|" : L"T|";
         // 明细进哈希：在途/限流的模型名变化（不只是数量）也要触发列表重建
         for (auto& [mname, mcnt] : a.in_flight_models)
             hash_in += mname + L":" + std::to_wstring(mcnt) + L",";
@@ -563,8 +603,12 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         struct Col { LPCWSTR t; int w; };
         // 状态列 76→132：模型请求/限流时单元格要放"请求中 glm-5.3-flash×1"这类长文本；
         // 让出的宽度来自 域 34→30 / 估算 58→46 / 实时 150→120（数值用千分位缩写仍可读）。
-        const Col cols[] = { { L"昵称", 88 }, { L"域", 30 }, { L"估算", 46 }, { L"实时(已用/总量)", 120 }, { L"状态", 132 }, { L"令牌剩", 50 } };
-        for (int i = 0; i < 6; i++) {
+        // v1.7.0 在状态列后新增"悬浮窗"列（是/否）：该号是否出现在悬浮提示账户明细，
+        // 与右键菜单"悬浮提示显示此账户"同一份 tip_hidden_uids，免去菜单也可直接看到。
+        const Col cols[] = { { L"昵称", 88 }, { L"域", 30 }, { L"估算", 46 }, { L"实时(已用/总量)", 120 },
+                             { L"状态", 132 }, { L"悬浮窗", 56 }, { L"令牌剩", 50 } };
+        static_assert(_countof(cols) == kAccCols, "账户表列序变更需同步 kAccCols/kTipCol/kTokenCol");
+        for (int i = 0; i < kAccCols; i++) {
             LVCOLUMNW cv{};
             cv.mask = LVCF_TEXT | LVCF_WIDTH;
             cv.pszText = const_cast<LPWSTR>(cols[i].t);
@@ -622,13 +666,16 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         cp->chk_live = MkCheck(*cp, L"积分优先显示实时值（有缓存时）", 8, 58, 240, IDC_CHK_LIVECRD, 3);
         cp->chk_tipfull = MkCheck(*cp, L"悬浮提示完整展开（超预算自动省略次要信息）", 8, 74, 340, IDC_CHK_TIPFULL, 3);
         cp->chk_tipacc = MkCheck(*cp, L"悬浮提示显示账户明细（多插件同载挤占悬浮提示空间时关闭）", 8, 90, 340, IDC_CHK_TIPACC, 3);
+        // v1.7.0：定时任务区默认不进 tooltip（默认值见 settings.h tooltip_tasks）；
+        // 需要盯任务触发时刻的在此打开。
+        cp->chk_tiptasks = MkCheck(*cp, L"悬浮提示显示定时任务明细（默认关闭；打开后每任务占一行）", 8, 106, 340, IDC_CHK_TIPTASKS, 3);
         // MkWnd 给所有控件都加了 WS_GROUP，会让每个单选各自成组、点不互相取消；
         // 清掉后两个的 WS_GROUP，让三个 radio（Z 序相邻）构成同一个互斥组；
         // 再清 WS_TABSTOP（标准组语义：仅组首有 Tab 停靠，组内靠方向键移动）。
         for (int i = 1; i < 3; i++)
             SetWindowLongW(cp->rad[i], GWL_STYLE, GetWindowLongW(cp->rad[i], GWL_STYLE) & ~(WS_GROUP | WS_TABSTOP));
-        MkHint(*cp, L"状态点颜色：绿=运行且可用 · 橙=在跑无可用账号 · 灰=已停止 · 红=端口被占/无响应", 8, 108, 404, 10, 3);
-        MkHint(*cp, L"任务栏宽度按最长样例预留；单击任务栏上的本栏位即可打开此设置窗。", 8, 122, 404, 10, 3);
+        MkHint(*cp, L"状态点颜色：绿=运行且可用 · 橙=在跑无可用账号 · 灰=已停止 · 红=端口被占/无响应", 8, 124, 404, 10, 3);
+        MkHint(*cp, L"任务栏宽度按最长样例预留；单击任务栏上的本栏位即可打开此设置窗。", 8, 138, 404, 10, 3);
         if (cp->work.show_mode >= 0 && cp->work.show_mode <= 2)
             SendMessageW(cp->rad[cp->work.show_mode], BM_SETCHECK, BST_CHECKED, 0);
         else
@@ -636,6 +683,7 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         SendMessageW(cp->chk_live, BM_SETCHECK, cp->work.show_live_credits ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(cp->chk_tipfull, BM_SETCHECK, cp->work.tooltip_full ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(cp->chk_tipacc, BM_SETCHECK, cp->work.tooltip_accounts ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessageW(cp->chk_tiptasks, BM_SETCHECK, cp->work.tooltip_tasks ? BST_CHECKED : BST_UNCHECKED, 0);
 
         // —— 页⑤ 高级 ——
         MkLabel(*cp, L"管理接口轮询(秒,≥15):", 8, 10, 100, 10, 4);
@@ -698,7 +746,7 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
                 Settings cur = SettingsStore::Instance().Get();
                 bool hidden = false;
                 for (auto& u : cur.tip_hidden_uids) if (u == a.uid8) { hidden = true; break; }
-                AppendMenuW(m, MF_STRING | (hidden ? 0 : MF_CHECKED), 7, L"悬浮提示显示此账户");
+                AppendMenuW(m, MF_STRING | (hidden ? 0 : MF_CHECKED), 7, L"悬浮提示显示此账户（账户表\"悬浮窗\"列）");
             }
             AppendMenuW(m, MF_STRING, 9, L"查看成本台账");
             int cmd = TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
@@ -709,6 +757,8 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             case 7: {
                 // 勾选切换：当前显示→隐藏（加进列表）；已隐藏→显示（移出列表）。
                 // 只动 tip_hidden_uids 一个字段（Modify 原子读改写，不覆盖其他线程修改）。
+                // 列表"悬浮窗"列的回填：Modify 后 RefreshSoon 触发下一轮 Refresh，
+                // tip_hidden_now 快照 + 行哈希比对发现变化即重建列表。
                 const std::wstring& uid8 = a.uid8;
                 SettingsStore::Instance().Modify([uid8](Settings& st) {
                     auto& v = st.tip_hidden_uids;
@@ -716,7 +766,7 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
                     if (it != v.end()) v.erase(it);
                     else v.push_back(uid8);
                 });
-                Worker::Instance().RefreshSoon(); // 立即重建 tooltip，菜单操作马上可见
+                Worker::Instance().RefreshSoon(); // 立即重建 tooltip 与账户表"悬浮窗"列
                 break;
             }
             case 1: case 2:
@@ -773,9 +823,10 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             } else {
                 box += L"模型｜消耗积分｜请求｜均/次\n";
                 for (auto& u : sn.usage)
-                    box += WideFormat(L"%s｜%s｜%d｜%s\n", u.model.c_str(),
+                    box += WideFormat(L"%s｜%s｜%d｜%s%s\n", u.model.c_str(),
                         FormatCreditNum(u.credit).c_str(), (int)u.requests,
-                        FormatCreditNum(u.credit_per_req).c_str());
+                        FormatCreditNum(u.credit_per_req).c_str(),
+                        u.ratio.empty() ? L"" : WideFormat(L"（%s）", u.ratio.c_str()).c_str());
                 box += L"\n服务端内存聚合，重启清零（自 " +
                     FormatTimeShort(sn.stats_ts) + L" 后拉取的快照）。";
             }
@@ -808,6 +859,7 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             c.work.show_live_credits = SendMessageW(c.chk_live, BM_GETCHECK, 0, 0) == BST_CHECKED;
             c.work.tooltip_full = SendMessageW(c.chk_tipfull, BM_GETCHECK, 0, 0) == BST_CHECKED;
             c.work.tooltip_accounts = SendMessageW(c.chk_tipacc, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            c.work.tooltip_tasks = SendMessageW(c.chk_tiptasks, BM_GETCHECK, 0, 0) == BST_CHECKED;
             c.work.show_mode = SendMessageW(c.rad[0], BM_GETCHECK, 0, 0) == BST_CHECKED ? SM_STATE_ACCOUNT
                 : (SendMessageW(c.rad[1], BM_GETCHECK, 0, 0) == BST_CHECKED ? SM_STATE_CREDITS : SM_STATE_ONLY);
             std::wstring bad;

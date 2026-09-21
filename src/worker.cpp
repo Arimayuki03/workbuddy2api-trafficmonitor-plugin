@@ -635,6 +635,9 @@ void Worker::PollAdmin()
             mu.credit = JNum(m, "credit");
             mu.credit_per_req = JNum(m, "credit_per_req");
             mu.total_tokens = JInt(m, "total_tokens");
+            // 上游积分倍率原文（上游 5009a1f，"x0.06" 形态；目录冷缓存/未下发时
+            // omitempty 整体省略）。缺失≠免费：空串原样保留，显示侧整体省略。
+            mu.ratio = Utf8ToWide(JStr(m, "credits"));
             usage.push_back(std::move(mu));
         }
         Update([&](Snapshot& sn) {
@@ -868,12 +871,18 @@ void Worker::BuildDisplayLocked()
 
     if (StateIsOn(sn.state)) {
         if (sn.admin_available && !sn.tasks.empty()) {
-            lines.push_back(L"—— 定时任务 ——");
-            for (auto& t : sn.tasks) {
-                std::wstring mark = t.running ? L"执行中" : (t.enabled ? L"启用" : L"停用");
-                std::wstring nxt = (t.running || !t.enabled || t.next_fire.empty())
-                    ? L"" : WideFormat(L" 下次%s", t.next_fire.c_str());
-                lines.push_back(L"  " + t.label + L"[" + mark + nxt + L"]");
+            // tooltip_tasks 开关（v1.7.0，默认关）：定时任务区不进 tooltip 的原因是它
+            // "always there, rarely useful"——6 行 × 20+ 字符的稳定开销换多数时间无观测
+            // 价值的信息；需要盯任务触发时刻的可在设置④显示页打开。关闭时健康概要等
+            // 汇总行不受影响，任务详情仍看设置窗③与插件命令菜单。
+            if (st.tooltip_tasks) {
+                lines.push_back(L"—— 定时任务 ——");
+                for (auto& t : sn.tasks) {
+                    std::wstring mark = t.running ? L"执行中" : (t.enabled ? L"启用" : L"停用");
+                    std::wstring nxt = (t.running || !t.enabled || t.next_fire.empty())
+                        ? L"" : WideFormat(L" 下次%s", t.next_fire.c_str());
+                    lines.push_back(L"  " + t.label + L"[" + mark + nxt + L"]");
+                }
             }
         } else if (!sn.admin_available) {
             lines.push_back(L"任务管理：需开启 wb2api 的 admin.enabled（README）");
@@ -893,9 +902,13 @@ void Worker::BuildDisplayLocked()
             int shown_u = 0;
             for (auto& u : sn.usage) {
                 if (shown_u++ >= 6) { lines.push_back(L"  …"); break; }
-                lines.push_back(WideFormat(L"  %s：%s分 / %d次（均 %s/次）",
+                // 积分倍率（上游 5009a1f 的 /v1/stats credits 字段）：有则缀尾，
+                // 空串整体省略（缺失≠免费，不显示 "x0.00"）。
+                std::wstring ratio = u.ratio.empty() ? L"" : L"（" + u.ratio + L"）";
+                lines.push_back(WideFormat(L"  %s：%s分 / %d次（均 %s/次）%s",
                     u.model.c_str(), FormatCreditNum(u.credit).c_str(),
-                    (int)u.requests, FormatCreditNum(u.credit_per_req).c_str()));
+                    (int)u.requests, FormatCreditNum(u.credit_per_req).c_str(),
+                    ratio.c_str()));
             }
         } else if (!sn.stats_available && sn.stats_ts > 0 && NowSec() - sn.stats_ts < 1800) {
             // 最近 30 分钟内探测过（200 或 404 都置 stats_ts）且当前不可用：

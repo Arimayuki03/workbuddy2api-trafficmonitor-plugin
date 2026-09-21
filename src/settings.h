@@ -29,6 +29,10 @@ struct Settings {
     // 单账户 tooltip 显隐（uid8 列表，落盘）：右键账户行切换。列表内的号不出现在
     // tooltip 账户明细里，但仍计入健康/总数等汇总行；清空列表即全部显示。
     std::vector<std::wstring> tip_hidden_uids;
+    // tooltip 显示"定时任务"区明细行。默认关闭（v1.7.0）：6 任务 × 20+ 字符是次要区里
+    // 最长且变化最频繁的，多数时间没有观测价值，预算收紧时也该最先让位；需要盯任务
+    // 下次触发时刻的再打开。默认值即"定时任务默认取消悬浮窗显示"的诉求。
+    bool tooltip_tasks = false;
     bool autostart_task = false;              // Windows 计划任务随登录启动服务
     bool start_with_tm = false;               // TrafficMonitor 启动时拉起服务
     bool auto_relaunch = false;               // 意外停止自动拉起

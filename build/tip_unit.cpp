@@ -1,5 +1,5 @@
 // tip_unit.cpp — FitTipBudget/JoinLines/TipUidHidden 单元测试（匿名 namespace 函数，经 include worker.cpp 访问）。
-// Base() 总长 281；预算分档：265=删模型用量区 / 210=再删积分汇总 / 100=只剩骨架。
+// Base() 总长 269；预算分档：265=删模型用量区 / 210=再删积分汇总 / 100=只剩骨架。
 #include "../src/worker.cpp"
 #include <cstdio>
 
@@ -18,9 +18,9 @@ static std::vector<std::wstring> Base()
         L"WorkBuddy2API：运行中（PID 1234）",        // 骨架
         L"地址：http://127.0.0.1:7863",              // 骨架
         L"健康 6/8 · 冷却 1 · 禁用 1 · 粘性会话 0",  // 骨架
-        L"—— 账户（估算）——",
-        L"  张三 (cn) 12,345分 正常",
-        L"  李四 (cn) 2,345分 请求中 glm-4.6×2",
+        L"—— 账户 ——",
+        L"  张三 (cn) 正常 实时:12,345",
+        L"  李四 (cn) 请求中 glm-4.6×2 实时:2,345",
         L"—— 定时任务 ——",
         L"  签到[启用 下次09:00]",
         L"实时积分：总剩 14,690（14:00 查询；下次可查 14:10）",

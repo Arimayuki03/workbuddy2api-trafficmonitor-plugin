@@ -25,7 +25,7 @@ struct Settings {
     int show_mode = SM_STATE_ACCOUNT;
     bool show_live_credits = true;            // 显示积分时优先用实时缓存
     bool tooltip_full = true;                 // tooltip 完整展开（超 700 字符预算自动舍弃次要行）；关闭=折叠为 4 行/~150 字符
-    bool tooltip_accounts = true;             // tooltip 显示"账户（估算）"区明细行；关闭可显著缩短 tooltip（多插件同载挤预算时用）
+    bool tooltip_accounts = true;             // tooltip 显示"账户"区明细行（行内只显实时积分）；关闭可显著缩短 tooltip（多插件同载挤预算时用）
     // 单账户 tooltip 显隐（uid8 列表，落盘）：右键账户行切换。列表内的号不出现在
     // tooltip 账户明细里，但仍计入健康/总数等汇总行；清空列表即全部显示。
     std::vector<std::wstring> tip_hidden_uids;

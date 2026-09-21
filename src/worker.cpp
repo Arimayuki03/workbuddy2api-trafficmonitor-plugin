@@ -812,8 +812,11 @@ void Worker::BuildDisplayLocked()
     // 账户明细区（tooltip_accounts）：每账号一行是 tooltip 最大的长度来源（实测 8 号
     // ~430 字符）。设置里可关掉，只留上面的健康概要——多插件同载挤占 1024 总额时的
     // 主要手段；关闭后 FitTipBudget 的逐行舍弃仍有兜底作用。
+    // 积分只显示实时值（v1.9.0）：估算=本地账本，随轮询单调扣减、长期偏差大，悬浮窗
+    // 这种小字号场景宁可少也不误导；实时缓存缺失时该号就不显示积分数，需要精确值的
+    // 去设置窗账户表（查询实时积分）。
     if (st.tooltip_accounts && StateIsOn(sn.state) && sn.accounts_valid && !sn.accounts.empty()) {
-        lines.push_back(L"—— 账户（估算）——");
+        lines.push_back(L"—— 账户 ——");
         int shown = 0;
         for (auto& a : sn.accounts) {
             // 单账户显隐（右键账户行切换）：隐藏的号不占 tooltip 行，但仍计入
@@ -876,9 +879,9 @@ void Worker::BuildDisplayLocked()
             std::wstring tk;
             if (a.token_expiry > NowSec())
                 tk = WideFormat(L" 令牌剩%lld天", (a.token_expiry - NowSec()) / 86400);
-            lines.push_back(WideFormat(L"  %s (%s) %s分 %s%s%s", a.nickname.c_str(),
+            lines.push_back(WideFormat(L"  %s (%s) %s%s%s", a.nickname.c_str(),
                 a.realm.empty() ? L"cn" : a.realm.c_str(),
-                FormatThousands(a.credits).c_str(), note.c_str(), live.c_str(), tk.c_str()));
+                note.c_str(), live.c_str(), tk.c_str()));
         }
     }
 

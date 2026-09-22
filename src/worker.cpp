@@ -833,19 +833,15 @@ void Worker::BuildDisplayLocked()
             else note = L"正常";
             // 在途模型（fork 的 in_flight_by_model）：账号有在途请求时指名道姓，
             // "请求中"升级为"请求中 glm-4.6×2"；无台账（旧版服务端/恰好归零）回退纯计数。
+            // 每号只取在途计数最大的一个模型（并列取服务端序首个）：多号并发多模型时
+            // 逐号罗列会把 tooltip 拼过宿主 1024 字符硬限（MFC CToolTipCtrl 抛
+            // CInvalidArgException 弹"遇到不适当的参数。"），全量明细看设置窗账户表。
             if (a.in_flight > 0 && !a.in_flight_models.empty()) {
-                note = L"请求中";
-                // 与限流明细同口径最多列 2 个：账号并发多模型时防 tooltip 顶到
-                // 宿主 1024 字符硬限（BuildDisplayLocked 尾注）。
-                int shown_if = 0;
-                for (auto& [mname, mcnt] : a.in_flight_models) {
-                    if (shown_if >= 2) {
-                        note += WideFormat(L" +%d个", (int)a.in_flight_models.size() - shown_if);
-                        break;
-                    }
-                    note += WideFormat(L" %s×%d", mname.c_str(), mcnt);
-                    shown_if++;
-                }
+                size_t top = 0;
+                for (size_t i = 1; i < a.in_flight_models.size(); ++i)
+                    if (a.in_flight_models[i].second > a.in_flight_models[top].second) top = i;
+                note = WideFormat(L"请求中 %s×%d", a.in_flight_models[top].first.c_str(),
+                    a.in_flight_models[top].second);
             }
             // 模型级限流明细（issue #36 的 rate_limited_models）：指名道姓带恢复时刻，
             // 最多列 2 个防 tooltip 膨胀，更多用 "共N个" 收口（"A、B共3个"是总数惯用法）。

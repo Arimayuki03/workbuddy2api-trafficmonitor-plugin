@@ -169,7 +169,10 @@ const char* kKinds[7] = { "checkin", "travel", "activity", "keepalive", "school"
 const wchar_t* kKindZh[7] = { L"签到", L"旅行", L"活跃", L"保活", L"开学季", L"夜猫子", L"任务队列" };
 const wchar_t* kSettingZh[3] = { L"开机自启(计划任务)", L"随TrafficMonitor启动", L"意外自动拉起" };
 
-int SettingIndex(int idx) { return idx - 17; }  // 17..19 → 0..2
+// v1.8.0 加第 7 类任务（任务队列）后菜单扩到 22 项：0启动 1停止 2重启 3设置 4积分 |
+// 5..11 立即执行 | 12..18 启用勾选 | 19..21 开关勾选。开关偏移必须跟着 17→19，
+// 否则勾选"开机自启"实际翻 auto_relaunch、后两项落进未定义区间点了没反应（回归修复）。
+int SettingIndex(int idx) { return idx - 19; }  // 19..21 → 0..2
 
 } // namespace
 

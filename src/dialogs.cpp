@@ -807,7 +807,9 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         // 状态列加宽到 172 并把"应用"压到 x=414：旧布局 150 宽度装不下长结果
         // （"ok=0 already=4 fail=0 skipped=0"约 40 字符）被截换行，视觉上像被下一行遮挡。
         // 页面可用宽度 ≈472 DLU（对话框 500 减边框/tab 边距），列宽合计 8+70+44+8+40+8+172+8+44+8+40 ≈ 458。
-        // v1.8.0 加第 7 行 queue（任务队列）：行距 26 不变，全部执行/提示整体下移一行。
+        // v1.8.0 加第 7 行 queue（任务队列）后纵向吃紧：tab 显示区高 ≈285 DLU（模板
+        // 298 减表头），行距压到 24、说明区 5 行收进 y=236..280，全部内容 ≤285 不再
+        // 超格（旧布局最后一行 y=292 底边 302，被 tab 显示区裁掉）。
         const struct { LPCWSTR t; int x; int w; } hdr[] = {
             { L"任务", 10, 64 }, { L"触发时间(点)", 82, 46 }, { L"下次", 150, 40 },
             { L"状态(上次结果)", 194, 176 }, { L"", 374, 44 }, { L"", 420, 40 },
@@ -815,7 +817,7 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         for (int k = 0; k < 6; k++) MkLabel(*cp, hdr[k].t, hdr[k].x, 24, hdr[k].w, 10, 2);
         cp->task_warn = MkLabel(*cp, L" ", 8, 8, 404, 10, 2);
         for (int i = 0; i < KIND_N; i++) {
-            int y = 42 + i * 26;
+            int y = 40 + i * 24;
             cp->task[i].chk = MkCheck(*cp, kKindZh[i], 8, y, 70, IDC_TASK_BASE + i * 10, 2);
             // 时间输入框不用 ES_NUMBER：内容是"9,21"逗号分隔小时列表
             cp->task[i].time = MkEdit(*cp, L"-", 82, y - 2, 44, IDC_TASK_BASE + i * 10 + 6, 2);
@@ -824,16 +826,14 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             cp->task[i].btn = MkBtn(*cp, L"立即执行", 374, y - 2, 44, 14, IDC_TASK_BASE + i * 10 + 5, 2);
             cp->task[i].apply = MkBtn(*cp, L"应用", 420, y - 2, 40, 14, IDC_TASK_BASE + i * 10 + 7, 2);
         }
-        cp->btn_runall = MkBtn(*cp, L"全部执行", 8, 228, 60, 14, IDC_BTN_RUNALL, 2);
-        cp->task_note = MkLabel(*cp, L"", 76, 230, 390, 10, 2);
-        MkHint(*cp, L"触发时间=24 小时制小时列表（逗号分隔，如 9,21）；「应用」经服务端 /admin 接口热生效，",
-            8, 246, 404, 10, 2);
-        MkHint(*cp, L"并写回服务 config.json（旧版服务端无该接口，回退直写文件、重启服务后生效）。",
-            8, 256, 404, 10, 2);
-        MkHint(*cp, L"立即执行在服务进程内跑（与定时任务同一把锁）；状态列显示上次执行结果与耗时。", 8, 268, 404, 10, 2);
-        MkHint(*cp, L"任务队列=扫描全账号待办（成长任务+开学季）并排队执行，消耗上游配额；定时排程默认关，",
-            8, 280, 404, 10, 2);
-        MkHint(*cp, L"需勾选启用（同网页端任务中心 opt-in 口径）；「立即执行」不等排程、随时可跑一次。", 8, 292, 404, 10, 2);
+        cp->btn_runall = MkBtn(*cp, L"全部执行", 8, 212, 60, 14, IDC_BTN_RUNALL, 2);
+        cp->task_note = MkLabel(*cp, L"", 76, 214, 390, 10, 2);
+        MkHint(*cp, L"触发时间=24 小时制小时列表（逗号分隔，如 9,21）；「应用」经 /admin 接口热生效并写回服务 config.json",
+            8, 232, 440, 10, 2);
+        MkHint(*cp, L"（旧版服务端无该接口，回退直写文件、重启服务后生效）。", 8, 242, 440, 10, 2);
+        MkHint(*cp, L"立即执行在服务进程内跑（与定时任务同一把锁）；状态列显示上次执行结果与耗时。", 8, 254, 440, 10, 2);
+        MkHint(*cp, L"任务队列=扫描全账号待办（成长任务+开学季）并排队执行，消耗上游配额；定时排程默认关，", 8, 264, 440, 10, 2);
+        MkHint(*cp, L"需勾选启用（同网页端 opt-in 口径）；「立即执行」不等排程、随时可跑一次。", 8, 274, 440, 10, 2);
 
         // —— 页④ 显示 ——
         cp->rad[0] = MkWnd(*cp, L"BUTTON", L"状态 + 账号数（如 4/4）", BS_AUTORADIOBUTTON | WS_TABSTOP, 0, 8, 8, 220, 10, IDC_RAD_ACCOUNT, 3);

@@ -38,7 +38,8 @@ public:
     bool RequestRestartService();
     bool RequestRunTask(const std::string& kind);            // kind 或 "all"
     bool RequestToggleTask(const std::string& kind, bool enabled);
-    bool RequestSetTaskHours(const std::string& kind, const std::vector<int>& hours); // 写回服务 config.json（重启生效）
+    bool RequestSetTaskHours(const std::string& kind, const std::vector<int>& hours); // 首选 PATCH /admin/tasks 热生效；旧版服务端回退直写 config.json（重启生效）
+    void ClearPendingHours(const std::string& kind); // 快照追上在途提交后由 UI 调用了结标记
     bool RequestRefreshCredits();
     // 账号手动停用/恢复（上游 a20d06f 端点）：op ∈ "disable"|"enable"|"revive"。
     // disable=摘出选号池（签到/保活照常）；enable=解手动位；revive=解自动禁用位。

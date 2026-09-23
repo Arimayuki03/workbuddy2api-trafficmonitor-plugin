@@ -16,6 +16,7 @@
 #include <cstring>
 #include <ctime>
 #include <cmath>
+#include <climits>
 #include <cstdlib>  // std::llabs（自愈校验用；别依赖 json.hpp 传递包含）
 #include <map>
 
@@ -165,6 +166,32 @@ int64_t RfcToUnix(const std::string& s)
 }
 
 int64_t NowSec() { return static_cast<int64_t>(time(nullptr)); }
+
+// hours 热改成功后本地重算"下次触发"显示（HH:mm），让设置窗不等下一轮
+// /admin/tasks 轮询（默认 60 秒）就能立即反映新排程。口径与服务端 nextFire
+// 一致：今天还没过的取今天，过了的取明天最早整点。
+std::wstring NextFireText(const std::vector<int>& hours)
+{
+    if (hours.empty()) return L"";
+    time_t now = time(nullptr);
+    std::tm today{};
+    localtime_s(&today, &now);
+    int cur = today.tm_hour * 60 + today.tm_min;
+    int best = INT_MAX; // 候选触发时刻的"分钟偏移"（可为跨天的更大值）
+    for (int h : hours) {
+        if (h < 0 || h > 23) continue;
+        int off = h * 60 - cur;
+        if (off <= 0) off += 24 * 60; // 今天已过 → 明天同一整点
+        if (off < best) best = off;
+    }
+    if (best == INT_MAX) return L"";
+    // 服务端快照只显示到分钟且不带日期；跨天仅在小时前缀"明天"提示。
+    int fire = (cur + best) % (24 * 60);
+    wchar_t txt[32];
+    swprintf_s(txt, L"%02d:%02d", fire / 60, fire % 60);
+    if (cur + best >= 24 * 60) return std::wstring(L"明天 ") + txt;
+    return txt;
+}
 
 std::wstring KindLabel(const std::string& kind)
 {
@@ -609,7 +636,17 @@ void Worker::PollAdmin()
     bool admin_ok = true;
     Update([&](Snapshot& sn) {
         sn.admin_available = admin_ok;
+        // 在途小时提交跨轮询结转：旧快照里还没了结的 pending_hours 搬进新快照。
+        // 对话框在显示时判"快照 hours 已等于 pending"即了结它——快照用旧值回填
+        // 窗口关闭；新任务行（服务端新增种类）无在途提交，自然为空。
+        std::map<std::string, std::wstring> pend;
+        for (auto& t : sn.tasks)
+            if (!t.pending_hours.empty()) pend[t.kind] = t.pending_hours;
         sn.tasks = std::move(tasks);
+        for (auto& t : sn.tasks) {
+            auto it = pend.find(t.kind);
+            if (it != pend.end()) t.pending_hours = it->second;
+        }
         sn.tasks_ts = (int64_t)time(nullptr);
     });
 
@@ -978,9 +1015,11 @@ void Worker::BuildDisplayLocked()
 // ============================================================================
 
 // SetTaskHours 落盘实现（动作线程内调用）：把服务 config.json 里 schedule.<key> 的
-// 整数数组替换为 hours。服务端没有改 hours 的接口（且 hours 热改需重启进程），
-// 所以由插件直写配置文件：解析后整体重dump（未知字段原值保留，键序会按字典序重排、
-// 统一 2 空格缩进），改前备份 .bak，tmp+rename 原子替换；内容未变则不落盘不提示。
+// 整数数组替换为 hours。现为主路径 PATCH /admin/tasks（worker.cpp RequestSetTaskHours）
+// 之外的旧版服务端回退：2026-09 之后的 wb2api 自带 hours 热改端点，走不到这里；
+// 旧版服务端没有接口，只能插件直写文件（重启服务后生效）。解析后整体重dump
+// （未知字段原值保留，键序会按字典序重排、统一 2 空格缩进），改前备份 .bak，
+// tmp+rename 原子替换；内容未变则不落盘不提示。
 // 覆盖防护：写回前复核 mtime，与服务端（任务勾选 PATCH 会落盘）并发写时放弃本次并
 // 提示重试，避免用旧副本把服务端刚持久化的改动静默回滚（审查 Medium 项）。
 static std::wstring SetTaskHours(const std::wstring& config_path, const std::string& key,
@@ -1055,18 +1094,65 @@ bool Worker::RequestSetTaskHours(const std::string& kind, const std::vector<int>
         if (s.service_dir.empty()) {
             note = L"未配置服务目录，无法写回 config.json";
         } else {
-            std::wstring cfg = s.service_dir + L"\\config.json";
-            // 小时快照以"服务端下发的当前值"为准做合法性检查（0-23）
-            std::wstring err = SetTaskHours(cfg, kind + "_hours", hours);
-            if (err.empty()) {
-                std::wstring hv;
-                for (int hvv : hours) {
-                    if (!hv.empty()) hv += L",";
-                    hv += std::to_wstring(hvv);
+            // 首选 PATCH /admin/tasks {kind, hours}：服务端热生效（免重启、立即重排
+            // 定时器）并最小 diff 写回 config.json。这同时修掉两个旧痛点：直写文件
+            // 后"重启服务前不生效"，以及设置窗被下一轮 /admin/tasks 快照用旧值回填。
+            // pending_hours：先在快照里立起"已提交未生效"标记，再发请求——HTTP 往返
+            // 最多 8 秒，期间设置窗可能已按旧快照回填；成功→更新为乐观值（快照追上
+            // 前显示目标值），失败→立即清除（旧快照即真实值，不能吞掉 web 端的修改）。
+            std::string bearer = SettingsStore::Instance().CurrentApiKey();
+            std::wstring hvtxt;
+            for (int hvv : hours) {
+                if (!hvtxt.empty()) hvtxt += L",";
+                hvtxt += std::to_wstring(hvv);
+            }
+            Update([&](Snapshot& sn) {
+                for (auto& t : sn.tasks)
+                    if (t.kind == kind) t.pending_hours = hvtxt;
+            });
+            std::wstring url = WideFormat(L"http://127.0.0.1:%d/admin/tasks", s.port);
+            json body{ { "kind", kind }, { "hours", hours } };
+            HttpResponse r = HttpJson(L"PATCH", url, bearer, body.dump(), 8000);
+            if (r.status == 200) {
+                note = WideFormat(L"%s 触发时间已热生效（%s 点），并写回 config.json",
+                    KindLabel(kind).c_str(), hvtxt.c_str());
+                // 乐观回写快照：不等下一轮 /admin/tasks（默认 60 秒），
+                // 设置窗"下次触发"列立即按新小时表显示。
+                std::wstring nf = NextFireText(hours);
+                Update([&](Snapshot& sn) {
+                    for (auto& t : sn.tasks) {
+                        if (t.kind != kind) continue;
+                        t.hours = hours;
+                        t.next_fire = nf;
+                        t.pending_hours.clear(); // 已是目标值，标记了结
+                    }
+                });
+            } else if (r.status == 401) {
+                note = L"api_key 不符（401），检查设置页或服务 config.json";
+                Update([&](Snapshot& sn) {
+                    for (auto& t : sn.tasks)
+                        if (t.kind == kind) t.pending_hours.clear();
+                });
+            } else {
+                // 其余状态码统一回退直写 config.json 的历史路径。旧版服务端两种表现：
+                // 404（loopback 闸外一律不存在感）或 400（decodeAdminJSON 拒未知字段
+                // "hours"，与"小时非法"无法区分）——直写文件对两者都安全。热生效的新
+                // 服务端不会落进这里（hours 合法即 200；非法在 UI 解析时已拦截）。
+                // 直写成功时 pending_hours 保持立起：运行中的服务在重启前 /admin/tasks
+                // 一直是旧小时表，标记挡住回填直到快照真追上（服务重启）。
+                std::wstring cfg = s.service_dir + L"\\config.json";
+                std::wstring err = SetTaskHours(cfg, kind + "_hours", hours);
+                if (err.empty()) {
+                    note = WideFormat(L"%s 触发时间已写回 config.json（%s 点），重启服务后生效",
+                        KindLabel(kind).c_str(), hvtxt.c_str());
+                } else {
+                    note = KindLabel(kind) + L"：" + err;
+                    Update([&](Snapshot& sn) {
+                        for (auto& t : sn.tasks)
+                            if (t.kind == kind) t.pending_hours.clear();
+                    });
                 }
-                note = WideFormat(L"%s 触发时间已写回 config.json（%s 点），重启服务后生效",
-                    KindLabel(kind).c_str(), hv.c_str());
-            } else note = KindLabel(kind) + L"：" + err;
+            }
         }
         Update([&](Snapshot& sn) { NoteLocked(sn, note); });
         EndAct(key);
@@ -1079,6 +1165,16 @@ void Worker::SetUserStopped(bool v)
 {
     // 原子读-改-写：先 Get 再 Update 的两步写法会与 UI/动作线程并发保存设置互相覆盖。
     SettingsStore::Instance().Modify([v](Settings& st) { st.user_stopped = v; });
+}
+
+void Worker::ClearPendingHours(const std::string& kind)
+{
+    // UI 判定"快照 hours 已等于在途提交目标值"后回调了结标记（池化快照的 owned
+    // 状态，不能让 UI 持锁直接改）。了结后时间框恢复跟随快照——web 端后续修改可见。
+    Update([&](Snapshot& sn) {
+        for (auto& t : sn.tasks)
+            if (t.kind == kind) t.pending_hours.clear();
+    });
 }
 
 bool Worker::RequestStartService()

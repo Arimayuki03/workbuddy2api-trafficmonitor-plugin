@@ -243,10 +243,10 @@ void ShowPage(Ctx& c, int idx)
 }
 
 // 触发时间编辑框内容："9,21"（纯小时列表，逗号分隔）；无数据 "-"。
-std::wstring HoursText(const TaskInfo& t)
+std::wstring HoursText(const std::vector<int>& hours)
 {
     std::wstring s;
-    for (int hv : t.hours) {
+    for (int hv : hours) {
         if (!s.empty()) s += L",";
         s += std::to_wstring(hv);
     }
@@ -491,7 +491,18 @@ void Refresh(Ctx& c)
             else status = L"本进程未执行过";
             SetWindowTextW(c.task[i].status, status.c_str());
             // 触发时间输入框：非焦点时回填服务端快照（焦点=用户可能正在编辑，跳过）。
-            std::wstring want = HoursText(*t);
+            // pending_hours 守卫（快照字段，worker 维护）：「应用」已提交但快照还没
+            // 跟上（热生效路径 ≤1 个轮询周期；旧版服务端直写文件路径=直到重启服务）
+            // 时显示提交目标值，防止每秒刷新把刚提交的值冲回旧值（v1.9.2 反馈的
+            // "设置不生效"观感）。快照追上 pending 即在快照里了结，恢复快照跟随——
+            // 之后 web 端改的值能正常显示；提交失败由 worker 立即清标记，同样不遮挡。
+            std::wstring want = HoursText(t->hours);
+            if (!t->pending_hours.empty()) {
+                if (t->pending_hours == want)
+                    Worker::Instance().ClearPendingHours(kKinds[i]); // 快照已追上，了结标记
+                else
+                    want = t->pending_hours; // 快照未跟上：显示用户提交的目标值
+            }
             if (GetFocus() != c.task[i].time && c.task[i].synced != want) {
                 SetWindowTextW(c.task[i].time, want.c_str());
                 c.task[i].synced = want;
@@ -659,12 +670,14 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         }
         cp->btn_runall = MkBtn(*cp, L"全部执行", 8, 228, 60, 14, IDC_BTN_RUNALL, 2);
         cp->task_note = MkLabel(*cp, L"", 76, 230, 390, 10, 2);
-        MkHint(*cp, L"触发时间=24 小时制小时列表（逗号分隔，如 9,21）；「应用」写回服务 config.json，重启服务后生效。",
+        MkHint(*cp, L"触发时间=24 小时制小时列表（逗号分隔，如 9,21）；「应用」经服务端 /admin 接口热生效，",
             8, 246, 404, 10, 2);
-        MkHint(*cp, L"立即执行在服务进程内跑（与定时任务同一把锁）；状态列显示上次执行结果与耗时。", 8, 258, 404, 10, 2);
+        MkHint(*cp, L"并写回服务 config.json（旧版服务端无该接口，回退直写文件、重启服务后生效）。",
+            8, 256, 404, 10, 2);
+        MkHint(*cp, L"立即执行在服务进程内跑（与定时任务同一把锁）；状态列显示上次执行结果与耗时。", 8, 268, 404, 10, 2);
         MkHint(*cp, L"任务队列=扫描全账号待办（成长任务+开学季）并排队执行，消耗上游配额；定时排程默认关，",
-            8, 270, 404, 10, 2);
-        MkHint(*cp, L"需勾选启用（同网页端任务中心 opt-in 口径）；「立即执行」不等排程、随时可跑一次。", 8, 282, 404, 10, 2);
+            8, 280, 404, 10, 2);
+        MkHint(*cp, L"需勾选启用（同网页端任务中心 opt-in 口径）；「立即执行」不等排程、随时可跑一次。", 8, 292, 404, 10, 2);
 
         // —— 页④ 显示 ——
         cp->rad[0] = MkWnd(*cp, L"BUTTON", L"状态 + 账号数（如 4/4）", BS_AUTORADIOBUTTON | WS_TABSTOP, 0, 8, 8, 220, 10, IDC_RAD_ACCOUNT, 3);

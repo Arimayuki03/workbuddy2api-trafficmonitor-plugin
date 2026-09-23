@@ -97,6 +97,12 @@ struct TaskInfo {
     bool running = false;
     int64_t last_run = 0;
     std::wstring last_result;
+    // 「应用」已提交但服务端快照尚未反映的小时表（"9,21" 文本形态；空=无在途提交）。
+    // 用途：提交与快照跟上的窗口期内（热生效路径 ≤1 个 /admin 轮询周期；旧版服务端
+    // 回退直写文件路径=直到重启服务），设置窗时间框显示它而不是旧快照，防每秒刷新
+    // 把用户刚提交的值回冲成旧值。提交**失败**立即清除（此时旧快照即真实值，继续
+    // 遮挡反而吞掉 web 端后来的修改）；快照追上（与 hours 一致）也清除。
+    std::wstring pending_hours;
 };
 
 struct CreditRow {

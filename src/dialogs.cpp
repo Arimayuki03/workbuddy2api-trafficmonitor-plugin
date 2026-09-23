@@ -52,12 +52,13 @@ constexpr int KIND_N = 7;
 const char* kKinds[KIND_N] = { "checkin", "travel", "activity", "keepalive", "school", "cat", "queue" };
 const wchar_t* kKindZh[KIND_N] = { L"签到", L"猫猫旅行", L"活跃上报", L"Token保活", L"开学季", L"夜猫子", L"任务队列" };
 
-// 账户表列序（v1.7.0 起 7 列）：昵称|域|估算|实时|状态|悬浮窗|令牌剩。
+// 账户表列序（v1.10.1 起 6 列，估算列删除——悬浮窗只显实时积分后表格口径一致）：
+// 昵称|域|实时|状态|悬浮窗|令牌剩。
 // "悬浮窗"列与"令牌剩"列的下标：FillAccountList 的 setcol 与建表列序（DlgProc 里
 // cols[]）共用这一份定义，加/删列时改这里即可，写单元格与建表不会错位。
-constexpr int kTipCol = 5;
-constexpr int kTokenCol = 6;
-constexpr int kAccCols = 7;
+constexpr int kTipCol = 4;
+constexpr int kTokenCol = 5;
+constexpr int kAccCols = 6;
 
 int64_t NowSecX() { return static_cast<int64_t>(time(nullptr)); }
 
@@ -69,8 +70,35 @@ bool IsTipHidden(const std::vector<std::wstring>& hidden, const std::wstring& ui
     return std::find(hidden.begin(), hidden.end(), uid8) != hidden.end();
 }
 
+// —— 账户表列头排序（v1.10.1）——
+// 每行按列算一个 SortKey（数值列带 num，文本列带 text），由 FillAccountList 的
+// 同一份来源构键（实时行的剩余值/失败态、令牌天数、状态文案、悬浮窗"是/否"），
+// 排序所见即所得，不存在"排序口径"与"单元格内容"两套文案漂移。
+struct SortKey {
+    int64_t num = 0;
+    std::wstring text;
+    bool is_num = false;
+};
+bool SortKeyLess(const SortKey& x, const SortKey& y, bool desc)
+{
+    if (x.is_num != y.is_num) return desc ? x.is_num : y.is_num; // 纯防御：同列恒同型
+    if (x.is_num) {
+        // 数值键：-1（失败/没查过）与 0 都算"无有效数值"，垫在正数之后；desc 整体反转。
+        bool okx = x.num > 0, oky = y.num > 0;
+        if (okx != oky) return desc ? !oky : okx;
+        if (!okx) return false; // 全无值：保序
+        if (x.num != y.num) return desc ? x.num > y.num : x.num < y.num;
+        return false;
+    }
+    if (x.text != y.text) return desc ? x.text > y.text : x.text < y.text;
+    return false; // 等值保序（stable_sort 下即 /status 原序）
+}
+
 bool SettingsEqual(const Settings& a, const Settings& b)
 {
+    // acc_sort_col/acc_sort_dir 不参与比较：排序在列头点击时已经独立落盘
+    // （SettingsStore::Modify），不属于"编辑中设置副本 vs 打开时快照"的 diff 语义，
+    // 纳入会让没碰任何输入框的对话框在退出时误报 changed。
     return a.service_dir == b.service_dir && a.port == b.port &&
         a.poll_interval_sec == b.poll_interval_sec &&
         a.admin_poll_sec == b.admin_poll_sec &&
@@ -112,6 +140,12 @@ struct Ctx {
     std::vector<std::wstring> tip_hidden_now;
     std::wstring acc_hash; // 账户行内容哈希：只有行内容变了才重建列表（旧 sig 含 last_ok_ts，
                            // 每个轮询周期必变，会周期性重置用户正在浏览的滚动位置/选中行）
+    // 账户表当前生效的列排序（列头点击即时更新；-1=未排序）。与 SettingsStore 里
+    // acc_sort_col/dir 同步：点击时写进这里立即生效+落盘，Refresh 构行序读这里——
+    // 不每次进 SettingsStore 拿（秒级轮询 × 锁竞争无意义）。行哈希织入排序态
+    // （"sort:%d:%d" 前缀），点击后即使行内容没变，下个 Refresh tick 也必重建。
+    int acc_sort_col = -1;
+    int acc_sort_dir = 0;
     // 页③
     TaskRow task[KIND_N];
     HWND task_warn = nullptr, btn_runall = nullptr, task_note = nullptr;
@@ -175,6 +209,33 @@ HWND MkEdit(Ctx& c, LPCWSTR t, int l, int tp, int w, int id, int page, DWORD ext
 #ifndef HDM_GETITEMRECT
 #define HDM_GETITEMRECT (HDM_FIRST + 7)
 #endif
+// 表头排序指示：把 ▲/▼ 缀到列文本尾（HDF_BITMAP/DI_SETSWITCH 各版 comctl 表现不一，
+// 文本后缀最稳）。col<0 清全部箭头。列文本从表头读回再改，不依赖建表时的原文副本。
+void AccApplySortHeader(HWND list, int col, int dir)
+{
+    HWND hdr = ListView_GetHeader(list);
+    if (!hdr) return;
+    int n = Header_GetItemCount(hdr);
+    for (int i = 0; i < n; i++) {
+        wchar_t buf[128] = {};
+        HDITEMW it{};
+        it.mask = HDI_TEXT | HDI_FORMAT;
+        it.pszText = buf;
+        it.cchTextMax = (int)(_countof(buf) - 2);
+        if (!Header_GetItem(hdr, i, &it)) continue;
+        // 去掉旧箭头（若有）再按当前列状态缀新的
+        std::wstring t(buf);
+        size_t p;
+        while ((p = t.find_last_of(L"▲▼")) != std::wstring::npos && p == t.size() - 1)
+            t.erase(p);
+        if (i == col) t += dir ? L"▼" : L"▲";
+        it.pszText = t.data();
+        it.cchTextMax = 0;
+        it.fmt = HDF_STRING;
+        Header_SetItem(hdr, i, &it);
+    }
+    InvalidateRect(hdr, nullptr, TRUE);
+}
 // 账户表子类化：主题 ListView 的网格线(240,240,240 浅灰)在默认 WM_PAINT 里最后画，
 // NM_CUSTOMDRAW 阶段的补画会被盖掉。只能在默认绘制完成后追加表头切割线——
 // 表头下沿那条与数据行分隔的横线在浅色主题里太淡（贴着表头渐变底），要加深一档。
@@ -193,6 +254,36 @@ LRESULT CALLBACK AccListProc(HWND h, UINT msg, WPARAM wp, LPARAM lp,
             LRESULT r = DefSubclassProc(h, msg, wp, lp);
             InvalidateRect(h, nullptr, FALSE);
             return r;
+        }
+        // 列头点击排序（v1.10.1）：同列再点反向，换列升序起步；-1 语义 = 未排序。
+        // 状态即时落盘（SettingsStore::Modify，与 tip_hidden_uids 同路径——不等设置窗
+        // 「保存」，对话框被取消也不回滚用户刚点的排序）。箭头缀在表头文本尾，排序
+        // 排他（一次只一列），清旧列箭头再设新列。Refresh 的行哈希织入了排序态，
+        // 下个秒级 tick 自动按新序重建列表，这里不用手动 FillAccountList。
+        if (nm && nm->hdr.code == HDN_ITEMCLICKW) {
+            // 从子类化的 ListView 拿回 Ctx：ref 是 SetWindowSubclass 传的 1，没用；
+            // GWLP_USERDATA 归宿主对话框管理，这里借 GetParent→窗口过程约定：
+            // Ctx 挂在对话框的 GWLP_USERDATA 上。
+            HWND dlg = GetParent(h);
+            Ctx* c = reinterpret_cast<Ctx*>(GetWindowLongPtrW(dlg, GWLP_USERDATA));
+            if (c) {
+                int clicked = (int)nm->iItem;
+                if (c->acc_sort_col == clicked)
+                    c->acc_sort_dir = c->acc_sort_dir ? 0 : 1;
+                else {
+                    c->acc_sort_col = clicked;
+                    c->acc_sort_dir = 0;
+                }
+                int col = c->acc_sort_col, dir = c->acc_sort_dir;
+                SettingsStore::Instance().Modify([col, dir](Settings& st) {
+                    st.acc_sort_col = col;
+                    st.acc_sort_dir = dir;
+                });
+                AccApplySortHeader(h, col, dir);
+                // 行序变了：行哈希织入排序态，下个 Refresh tick 自动按新序重建列表；
+                // RefreshSoon 推一把让重建更快发生。
+                Worker::Instance().RefreshSoon();
+            }
         }
     }
     LRESULT r = DefSubclassProc(h, msg, wp, lp);
@@ -255,86 +346,127 @@ std::wstring HoursText(const std::vector<int>& hours)
 
 void FillAccountList(Ctx& c, const Snapshot& sn)
 {
-    ListView_DeleteAllItems(c.acc_list);
-    for (auto& a : sn.accounts) {
-        LVITEMW it{};
-        it.mask = LVIF_TEXT;
-        it.iItem = ListView_GetItemCount(c.acc_list);
-        it.pszText = const_cast<LPWSTR>(a.nickname.c_str());
-        int row = ListView_InsertItem(c.acc_list, &it);
-        if (row < 0) continue;
-        auto setcol = [&](int col, const std::wstring& v) {
-            ListView_SetItemText(c.acc_list, row, col, const_cast<LPWSTR>(v.c_str()));
-        };
-        setcol(1, a.realm.empty() ? L"cn" : a.realm);
-        setcol(2, FormatThousands(a.credits));
-        // 实时列："剩余（已用/总量）"——used/size 来自 /admin/credits，查询失败/未查时只有 "-"
-        std::wstring livev = L"-";
+    // 行序：按当前列排序键排（无排序=快照原序）。先构 (键, 行数据) 对再 stable_sort，
+    // 等值行保持 /status 原序；键与单元格文案同一来源（status_text/实时行/悬浮窗列），
+    // 排序所见即所得。
+    struct Row {
+        SortKey key;
+        const AccountInfo* a;
+    };
+    std::vector<Row> rows;
+    rows.reserve(sn.accounts.size());
+    const bool desc = c.acc_sort_col >= 0 && c.acc_sort_dir == 1;
+    auto live_of = [&](const AccountInfo& a, std::wstring* text, int64_t* num) {
+        // 实时列的键来源："剩余（已用/总量）"文本 + 纯剩余数值（排序用）。
+        // 失败/未查过：文本"失败"/"-"，数值 -1（SortKeyLess 里垫底）。
         for (auto& r : sn.credits.rows) {
-            if (r.uid8 == a.uid8) {
-                if (!r.ok) livev = L"失败";
-                else if (r.used >= 0 && r.size >= 0)
-                    livev = WideFormat(L"%s（%s/%s）", FormatThousands(r.remain).c_str(),
+            if (r.uid8 != a.uid8) continue;
+            if (!r.ok) { if (text) *text = L"失败"; if (num) *num = -1; return; }
+            if (num) *num = r.remain;
+            if (text) {
+                if (r.used >= 0 && r.size >= 0)
+                    *text = WideFormat(L"%s（%s/%s）", FormatThousands(r.remain).c_str(),
                         FormatThousands(r.used).c_str(), FormatThousands(r.size).c_str());
-                else livev = FormatThousands(r.remain);
-                break;
+                else *text = FormatThousands(r.remain);
             }
+            return;
         }
-        setcol(3, livev);
-        std::wstring st;
+        if (text) *text = L"-";
+        if (num) *num = -1;
+    };
+    auto status_text = [&](const AccountInfo& a) -> std::wstring {
         // 双位状态（上游 a20d06f）：disabled=系统自动禁用（可 revive 复活）；
         // manual_disabled=运维手动停用（可 enable 恢复）；叠加态分别展示不合并。
         if (a.manual_disabled && a.disabled)
-            st = L"停用(手动" + (a.manual_reason.empty() ? L"" : L":" + a.manual_reason) +
-                 L"+自动" + (a.reason.empty() ? L"" : L":" + a.reason) + L")";
-        else if (a.manual_disabled) st = a.manual_reason.empty() ? L"手动停用" : L"手动停用 " + a.manual_reason;
-        else if (a.disabled) st = a.reason.empty() ? L"自动禁用" : L"自动禁用 " + a.reason;
-        else if (a.cooling) {
+            return L"停用(手动" + (a.manual_reason.empty() ? L"" : L":" + a.manual_reason) +
+                   L"+自动" + (a.reason.empty() ? L"" : L":" + a.reason) + L")";
+        if (a.manual_disabled) return a.manual_reason.empty() ? L"手动停用" : L"手动停用 " + a.manual_reason;
+        if (a.disabled) return a.reason.empty() ? L"自动禁用" : L"自动禁用 " + a.reason;
+        if (a.cooling) {
             // 服务端 cooling 是三合一口径（冷却/熔断/连败降权任一未到期）。按"哪一翼
             // 撑到最远"细分标注，降权再带上连败计数（阈值 5 次，见服务端 degrade_threshold）。
             int64_t nowx = NowSecX();
             if (a.degrade_until > nowx && a.degrade_until >= a.until && a.degrade_until >= a.breaker_until)
-                st = WideFormat(L"降权至 %s(连败%d)", FormatTimeShort(a.degrade_until).c_str(), a.consec_fails);
-            else if (a.breaker_until > nowx && a.breaker_until >= a.until)
-                st = L"熔断至 " + FormatTimeShort(a.breaker_until);
-            else
-                st = a.until > nowx ? L"冷却至 " + FormatTimeShort(a.until) : L"冷却中";
+                return WideFormat(L"降权至 %s(连败%d)", FormatTimeShort(a.degrade_until).c_str(), a.consec_fails);
+            if (a.breaker_until > nowx && a.breaker_until >= a.until)
+                return L"熔断至 " + FormatTimeShort(a.breaker_until);
+            return a.until > nowx ? L"冷却至 " + FormatTimeShort(a.until) : L"冷却中";
         }
-        else if (a.rl_models > 0) {
+        if (a.rl_models > 0) {
             // 限流模型指名道姓：单模型直接给名（"模型限额 glm-4.6 至 14:00"），
             // 多模型列前 2 个 + "共N个"（总数惯用法，与 worker.cpp tooltip 同口径）。
             // 明细缺失（旧版服务端）回退数量口径。
             if (a.rl_detail.empty())
-                st = a.rl_until > NowSecX()
+                return a.rl_until > NowSecX()
                     ? WideFormat(L"模型限额×%d(至%s)", (int)a.rl_models, FormatTimeShort(a.rl_until).c_str())
                     : WideFormat(L"模型限额×%d", (int)a.rl_models);
-            else {
-                std::wstring names = a.rl_detail[0].model;
-                if (a.rl_detail.size() > 1) {
-                    names += L"、" + a.rl_detail[1].model;
-                    if (a.rl_detail.size() > 2)
-                        names += WideFormat(L"共%d个", (int)a.rl_detail.size());
-                }
-                st = L"模型限额 " + names;
-                if (a.rl_until > NowSecX()) st += WideFormat(L"(至%s)", FormatTimeShort(a.rl_until).c_str());
+            std::wstring names = a.rl_detail[0].model;
+            if (a.rl_detail.size() > 1) {
+                names += L"、" + a.rl_detail[1].model;
+                if (a.rl_detail.size() > 2)
+                    names += WideFormat(L"共%d个", (int)a.rl_detail.size());
             }
+            std::wstring st = L"模型限额 " + names;
+            if (a.rl_until > NowSecX()) st += WideFormat(L"(至%s)", FormatTimeShort(a.rl_until).c_str());
+            return st;
         }
-        else if (a.in_flight > 0) {
+        if (a.in_flight > 0) {
             // 在途模型指名道姓（fork 的 in_flight_by_model）：多模型 "glm-4.6×2+glm-4.5"，
             // 台账缺失回退纯计数。单元格宽度有限，最多列 2 个模型。
             if (a.in_flight_models.empty())
-                st = WideFormat(L"请求中(%d)", a.in_flight);
-            else {
-                st = L"请求中 ";
-                int shown_if = 0;
-                for (auto& [mname, mcnt] : a.in_flight_models) {
-                    if (shown_if++ >= 2) { st += WideFormat(L"+%d个", (int)a.in_flight_models.size() - shown_if + 1); break; }
-                    st += (shown_if > 1 ? L"+" : L"") + WideFormat(L"%s×%d", mname.c_str(), mcnt);
-                }
+                return WideFormat(L"请求中(%d)", a.in_flight);
+            std::wstring st = L"请求中 ";
+            int shown_if = 0;
+            for (auto& [mname, mcnt] : a.in_flight_models) {
+                if (shown_if++ >= 2) { st += WideFormat(L"+%d个", (int)a.in_flight_models.size() - shown_if + 1); break; }
+                st += (shown_if > 1 ? L"+" : L"") + WideFormat(L"%s×%d", mname.c_str(), mcnt);
             }
+            return st;
         }
-        else st = L"正常";
-        setcol(4, st);
+        return L"正常";
+    };
+    for (auto& a : sn.accounts) {
+        Row r{};
+        r.a = &a;
+        switch (c.acc_sort_col) {
+        case 0: r.key.text = a.nickname; break;
+        case 1: r.key.text = a.realm.empty() ? L"cn" : a.realm; break;
+        case 2: live_of(a, &r.key.text, &r.key.num); r.key.is_num = true; break;
+        case 3: r.key.text = status_text(a); break;
+        case 4: r.key.text = IsTipHidden(c.tip_hidden_now, a.uid8) ? L"否" : L"是"; break;
+        case 5: {
+            int64_t days = a.token_expiry > NowSecX() ? (a.token_expiry - NowSecX()) / 86400 : -1;
+            r.key.num = days; r.key.is_num = true;
+            r.key.text = days >= 0 ? std::to_wstring(days) : std::wstring(L"-");
+            break;
+        }
+        default: break; // 未排序：key 空着，stable_sort 保原序
+        }
+        rows.push_back(std::move(r));
+    }
+    if (c.acc_sort_col >= 0)
+        std::stable_sort(rows.begin(), rows.end(),
+            [desc](const Row& x, const Row& y) { return SortKeyLess(x.key, y.key, desc); });
+
+    ListView_DeleteAllItems(c.acc_list);
+    for (auto& row : rows) {
+        const AccountInfo& a = *row.a;
+        LVITEMW it{};
+        it.mask = LVIF_TEXT;
+        it.iItem = ListView_GetItemCount(c.acc_list);
+        it.pszText = const_cast<LPWSTR>(a.nickname.c_str());
+        int r = ListView_InsertItem(c.acc_list, &it);
+        if (r < 0) continue;
+        auto setcol = [&](int col, const std::wstring& v) {
+            ListView_SetItemText(c.acc_list, r, col, const_cast<LPWSTR>(v.c_str()));
+        };
+        setcol(1, a.realm.empty() ? L"cn" : a.realm);
+        // 实时列："剩余（已用/总量）"——used/size 来自 /admin/credits，查询失败/未查时只有 "-"
+        std::wstring livev;
+        int64_t livenum = -1;
+        live_of(a, &livev, &livenum);
+        setcol(2, livev);
+        setcol(3, status_text(a));
         // 悬浮窗列：该号当前是否出现在悬浮提示账户明细里（tip_hidden_uids 反相）。
         // 与右键菜单"悬浮提示显示此账户"同一份数据，此处提供免菜单的可见性。
         bool tipshown = !IsTipHidden(c.tip_hidden_now, a.uid8);
@@ -344,7 +476,7 @@ void FillAccountList(Ctx& c, const Snapshot& sn)
     }
 }
 
-// 账户表列宽一次性预设：设计列宽按 96 DPI 标定（昵称88 域30 估算46 状态132 令牌剩50，
+// 账户表列宽一次性预设：设计列宽按 96 DPI 标定（昵称88 域28 状态132 令牌剩48，
 // 实时列吃余量），乘以"客户区实际宽 ÷ 设计总宽"的缩放系数分给固定列——高 DPI 下
 // 控件像素变宽、列宽同步变大，恰好填满、不留无表头的空列（固定像素对不上控件宽
 // 的截图 bug 来源）。只在建表时调一次，之后永不重设：运行期自适应会在 WM_SIZE/
@@ -356,16 +488,16 @@ void FitAccountColumnsOnce(Ctx& c)
     GetClientRect(c.acc_list, &rc);
     int total = rc.right - rc.left;
     if (total <= 0) return; // 页②还没显示过：翻到页②时客户区才有宽
-    // v1.7.0 起第 kTipCol 列为"悬浮窗"（是/否）：56 足够两字 + 表头；令牌剩挪到第 kTokenCol 列。
-    // 下标 3 = 实时列（吃余量，设计宽 0 单独处理）。数组顺序与 kTipCol/kTokenCol/kAccCols
+    // v1.10.1 起估算列删除，释放的宽度留给实时列；kTipCol/kTokenCol 随之前移。
+    // 下标 2 = 实时列（吃余量，设计宽 0 单独处理）。数组顺序与 kTipCol/kTokenCol/kAccCols
     // （文件头）及 DlgProc 里 cols[] 建表列序一一对应。
-    static const int kDesign[] = { 88, 28, 42, 0, 126, 56, 48 };
+    static const int kDesign[] = { 88, 28, 0, 126, 56, 48 };
     constexpr int kCols = sizeof(kDesign) / sizeof(kDesign[0]);
     static_assert(kCols == kAccCols, "列宽预设与账户表列数不一致");
-    constexpr int kLiveDesign = 120; // 实时列设计宽（吃余量列的配比基数）
+    constexpr int kLiveDesign = 160; // 实时列设计宽（吃余量列的配比基数）
     int fixed_design = 0;
-    for (int w : kDesign) fixed_design += w; // 88+28+42+126+56+48 = 388
-    const int total_design = fixed_design + kLiveDesign; // 508
+    for (int w : kDesign) fixed_design += w; // 88+28+126+56+48 = 346
+    const int total_design = fixed_design + kLiveDesign; // 506
     int fixed = fixed_design * total / total_design;
     int live = total - fixed;
     if (live < 60) live = 60; // 极窄窗口下实时列保底可读
@@ -433,18 +565,20 @@ void Refresh(Ctx& c)
             sn.credits.total_used >= 0 ? FormatThousands(sn.credits.total_used).c_str() : L"-");
     else cool = L"尚未查询 · 按钮会逐号向服务端发起实时余额查询";
     SetWindowTextW(c.lbl_cool, cool.c_str());
-    // 行内容哈希：纳入决定每一行显示内容的字段（uid/昵称/域/估算/实时列/状态/悬浮窗/令牌）。
+    // 行内容哈希：纳入决定每一行显示内容的字段（uid/昵称/域/实时列/状态/悬浮窗/令牌）。
     // 不含 last_ok_ts/credits.ts 这类"每次轮询必变"的时间戳——列表只在内容真变时重建。
     // tip_hidden_now：本次刷新时刻的显隐快照，悬浮窗列内容随右键菜单操作即时重建
     // （Modify 保存后 RefreshSoon→下一轮 Copy 带出新值，哈希比对发现变化即重填）。
+    // 前缀织入排序态：点击列头即使行内容没变也要立即按新序重建（哈希必不同）。
     {
         Settings st_now = SettingsStore::Instance().Get();
         c.tip_hidden_now = st_now.tip_hidden_uids;
     }
-    std::wstring hash_in;
+    std::wstring hash_in = WideFormat(L"sort:%d:%d;", c.acc_sort_col, c.acc_sort_dir);
     for (auto& a : sn.accounts) {
+        // 估算（a.credits）不进哈希：估算列已删，账户表不再展示该值
         hash_in += a.uid8 + L"|" + a.nickname + L"|" + a.realm + L"|" +
-            std::to_wstring(a.credits) + L"|" + std::to_wstring(a.in_flight) + L"|" +
+            std::to_wstring(a.in_flight) + L"|" +
             std::to_wstring(a.until) + L"|" + std::to_wstring(a.breaker_until) + L"|" +
             std::to_wstring(a.degrade_until) + L"|" + std::to_wstring(a.consec_fails) + L"|" +
             std::to_wstring(a.rl_models) + L"|" + std::to_wstring(a.token_expiry) + L"|" +
@@ -605,6 +739,7 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         // —— 页② 账户与积分 ——
         // 列宽一次性预设（见 FitAccountColumnsOnce）：建表时按客户区宽定死，之后
         // 不随窗口缩放/翻页重设——用户可自由拖动列宽，不会被弹回。
+        // HDS_BUTTONS：表头渲染成可按压按钮（点击排序的视觉暗示，v1.10.1 起列头可点）。
         cp->acc_list = MkWnd(*cp, WC_LISTVIEWW, L"",
             LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER, 0, 8, 8, 462, 140, IDC_LST_ACC, 1);
         // LVS_EX_DOUBLEBUFFER：列表整帧先进内存位图再上屏，拖列宽/滚动的重绘不闪。
@@ -614,12 +749,20 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         // 横线（经典毛病）。切 Explorer 主题后表头与网格线走同一套绘制，行列线对齐。
         SetWindowTheme(cp->acc_list, L"Explorer", nullptr);
         SetWindowSubclass(cp->acc_list, AccListProc, 1, 0);
+        // 列头点击排序：建表后给表头补 HDS_BUTTONS 样式（MkWnd 的样式参数是 ListView
+        // 的；表头样式只能建完再改），并恢复上次会话的排序态（列序号 + 方向）。
+        if (HWND hdr0 = ListView_GetHeader(cp->acc_list))
+            SetWindowLongPtrW(hdr0, GWL_STYLE,
+                GetWindowLongPtrW(hdr0, GWL_STYLE) | HDS_BUTTONS | HDS_DRAGDROP);
+        cp->acc_sort_col = cp->work.acc_sort_col;
+        cp->acc_sort_dir = cp->work.acc_sort_dir;
         struct Col { LPCWSTR t; int w; };
-        // 状态列 76→132：模型请求/限流时单元格要放"请求中 glm-5.3-flash×1"这类长文本；
-        // 让出的宽度来自 域 34→30 / 估算 58→46 / 实时 150→120（数值用千分位缩写仍可读）。
+        // 状态列 132：模型请求/限流时单元格要放"请求中 glm-5.3-flash×1"这类长文本。
         // v1.7.0 在状态列后新增"悬浮窗"列（是/否）：该号是否出现在悬浮提示账户明细，
         // 与右键菜单"悬浮提示显示此账户"同一份 tip_hidden_uids，免去菜单也可直接看到。
-        const Col cols[] = { { L"昵称", 88 }, { L"域", 30 }, { L"估算", 46 }, { L"实时(已用/总量)", 120 },
+        // v1.10.1 起估算列删除（tooltip 账户行 v1.9.0 只显实时积分后表格口径一致），
+        // 释放宽度由实时列吃下；列头点击可排序（见 AccListProc 的 HDN_ITEMCLICKW）。
+        const Col cols[] = { { L"昵称", 88 }, { L"域", 30 }, { L"实时(已用/总量)", 120 },
                              { L"状态", 132 }, { L"悬浮窗", 56 }, { L"令牌剩", 50 } };
         static_assert(_countof(cols) == kAccCols, "账户表列序变更需同步 kAccCols/kTipCol/kTokenCol");
         for (int i = 0; i < kAccCols; i++) {
@@ -635,18 +778,20 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         cp->lbl_cool = MkLabel(*cp, L"", 94, 158, 370, 10, 1);
         MkLabel(*cp, L"自动刷新周期(分钟,0=关,≥1):", 8, 178, 150, 10, 1);
         cp->citv_edt = MkEdit(*cp, std::to_wstring(cp->work.credits_refresh_interval_min).c_str(), 160, 176, 34, IDC_EDT_CINTERVAL, 1, ES_NUMBER);
-        MkHint(*cp, L"估算=本地账本，插件轮询零成本；实时=服务端逐号查上游余额并回写账本，括号内为该号已用/原始总量。",
+        MkHint(*cp, L"实时=服务端逐号查上游余额并回写账本，括号内为该号已用/原始总量（估算列已移除，精确值看实时）。",
             8, 194, 404, 10, 1);
-        MkHint(*cp, L"周期保存时自动同步到服务端冷却（PATCH /admin/credits-interval，免重启、写回服务端 config.json 留 .bak）。",
+        MkHint(*cp, L"点击列头排序（再点反向，排序随插件配置持久化）；双击账户行可看该号每模型实测成本台账。",
             8, 206, 404, 10, 1);
-        MkHint(*cp, L"插件只按服务端允许的节奏查询，不会触发 429；双击账户行可看该号每模型实测成本台账。",
+        MkHint(*cp, L"周期保存时自动同步到服务端冷却（PATCH /admin/credits-interval，免重启、写回服务端 config.json 留 .bak）。",
             8, 218, 404, 10, 1);
-        MkHint(*cp, L"右键账户行可停用/恢复选号（需 admin.enabled）：停用=手动摘出选号池（签到/保活照常），",
+        MkHint(*cp, L"插件只按服务端允许的节奏查询，不会触发 429。",
             8, 230, 404, 10, 1);
-        MkHint(*cp, L"恢复=解除手动停用；「复活」仅对系统自动禁用的账号可用。状态列区分 手动停用/自动禁用 双位。",
+        MkHint(*cp, L"右键账户行可停用/恢复选号（需 admin.enabled）：停用=手动摘出选号池（签到/保活照常），",
             8, 242, 404, 10, 1);
-        MkHint(*cp, L"「清除冷却」强制归零该号冷却/熔断/降权/模型限额（wb2api ≥ v1.10.0），不停用选号；旧版服务端提示不可用。",
+        MkHint(*cp, L"恢复=解除手动停用；「复活」仅对系统自动禁用的账号可用。状态列区分 手动停用/自动禁用 双位。",
             8, 254, 404, 10, 1);
+        MkHint(*cp, L"「清除冷却」强制归零该号冷却/熔断/降权/模型限额（wb2api ≥ v1.10.0），不停用选号；旧版服务端提示不可用。",
+            8, 266, 404, 10, 1);
 
         // —— 页③ 定时任务 ——
         // 表头一行 + 每任务一行：勾选 | 触发时间(可编辑) | 下次 | 上次/状态 | 立即执行 | 应用。
@@ -723,6 +868,9 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         MkHint(*cp, L"与你的 API 使用互不影响。实时积分查询由服务端冷却与单飞兜底，防止任何路径触发上游风控。", 8, 118, 460, 10, 4);
 
         ShowPage(*cp, 0);
+        // 恢复上次会话的排序指示（排序态已在建表后从 work 拷进 ctx）
+        if (cp->acc_sort_col >= 0)
+            AccApplySortHeader(cp->acc_list, cp->acc_sort_col, cp->acc_sort_dir);
         SetTimer(hDlg, 7, 1000, nullptr);
         Refresh(*cp);
         return TRUE;
@@ -748,8 +896,18 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             ScreenToClient(cp->acc_list, &ht.pt);
             int idx = ListView_HitTest(cp->acc_list, &ht);
             Snapshot sn = Worker::Instance().Copy();
-            if (idx < 0 || idx >= (int)sn.accounts.size()) return TRUE;
-            const AccountInfo& a = sn.accounts[idx];
+            // 排序后 ListView 行序 ≠ /status 快照下标：按行首昵称+uid8 从快照里找回
+            // 对应账号（FillAccountList 行数据即快照账号本体，昵称唯一性由服务端保证；
+            // 极端重名时退化为"同昵称第一个"，操作仍落在一个真实账号上）。
+            if (idx < 0) return TRUE;
+            wchar_t nick[128] = {};
+            ListView_GetItemText(cp->acc_list, idx, 0, nick, (int)(_countof(nick)));
+            const AccountInfo* pa = nullptr;
+            for (auto& acc : sn.accounts) {
+                if (acc.nickname == nick) { pa = &acc; break; }
+            }
+            if (!pa) return TRUE;
+            const AccountInfo& a = *pa;
             HMENU m = CreatePopupMenu();
             if (!m) return TRUE;
             // admin 不可用（/admin 未启用或版本过旧）时操作项置灰——端点根本不存在，
@@ -811,7 +969,9 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
                     Worker::Instance().RequestClearCooldown(uid);
                 break;
             case 9:
-                SendMessageW(hDlg, WB_APP_SHOWCOSTS, 0, (LPARAM)idx);
+                // 与双击同一收口：传昵称文本，弹窗处理处按昵称找快照账号
+                SendMessageW(hDlg, WB_APP_SHOWCOSTS, 0,
+                    reinterpret_cast<LPARAM>(std::wstring(a.nickname).c_str()));
                 break;
             default: break;
             }
@@ -821,17 +981,30 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         // wb2api 上游 2493532 透出）。口径与 wb2api 的 status-report.ps1 一致：
         // 每1k=实测千 token 均价（EMA，≤0 即实测免费），6 小时无观测服务端自动删行。
         if (cp->acc_list && nh->hwndFrom == cp->acc_list && nh->code == LVN_ITEMACTIVATE) {
-            SendMessageW(hDlg, WB_APP_SHOWCOSTS, 0, (LPARAM)ListView_GetNextItem(cp->acc_list, -1, LVNI_SELECTED));
+            // 排序后行号≠快照下标：直接传行首昵称文本（弹窗处理处按昵称从最新快照找）。
+            int sel = ListView_GetNextItem(cp->acc_list, -1, LVNI_SELECTED);
+            if (sel < 0) return TRUE;
+            wchar_t nick[128] = {};
+            ListView_GetItemText(cp->acc_list, sel, 0, nick, (int)(_countof(nick)));
+            SendMessageW(hDlg, WB_APP_SHOWCOSTS, 0,
+                reinterpret_cast<LPARAM>(std::wstring(nick).c_str()));
             return TRUE;
         }
         return FALSE;
     }
     case WB_APP_SHOWCOSTS: {
         if (!cp) return TRUE;
-        int idx = (int)lp;
+        // lp = 行首昵称文本指针（LVN_ITEMACTIVATE 处 std::wstring 的 c_str()——
+        // SendMessage 是同步调用，栈上临时存活到处理完）。按昵称从最新快照找回账号：
+        // 排序后行号≠快照下标，昵称是表格行与快照之间唯一的稳定键。
+        const wchar_t* nick = reinterpret_cast<const wchar_t*>(lp);
         Snapshot sn = Worker::Instance().Copy();
-        if (idx < 0 || idx >= (int)sn.accounts.size()) return TRUE;
-        const AccountInfo& a = sn.accounts[idx];
+        const AccountInfo* pa = nullptr;
+        for (auto& acc : sn.accounts) {
+            if (acc.nickname == nick) { pa = &acc; break; }
+        }
+        if (!pa) return TRUE;
+        const AccountInfo& a = *pa;
         std::wstring box = a.nickname + L"（" + (a.realm.empty() ? L"cn" : a.realm) +
             L"）每模型实测成本\n\n";
         if (a.costs.empty()) {

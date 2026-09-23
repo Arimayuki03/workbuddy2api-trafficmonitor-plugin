@@ -67,6 +67,13 @@ Settings ParseSettings(const json& j)
     get_bool("auto_relaunch", s.auto_relaunch);
     get_bool("logging", s.logging);
     get_bool("user_stopped", s.user_stopped);
+    // acc_sort_col/acc_sort_dir：账户表列头排序持久化（可选，旧配置没有即 -1=未排序）。
+    // 防呆：列号超出当前列范围（手改 json / 列序调整后的旧配置）回落未排序；
+    // 方向非 0/1 回落升序。
+    get_int("acc_sort_col", s.acc_sort_col);
+    get_int("acc_sort_dir", s.acc_sort_dir);
+    if (s.acc_sort_col < -1 || s.acc_sort_col > 5) s.acc_sort_col = -1;
+    if (s.acc_sort_dir != 0 && s.acc_sort_dir != 1) s.acc_sort_dir = 0;
     // 数值归一（用户手改 json 防呆）：全部回落默认，不给 0/负值留运行期除零或疯狂轮询的口子。
     if (s.port <= 0 || s.port > 65535) s.port = 7863;
     if (s.poll_interval_sec < 10) s.poll_interval_sec = 30;
@@ -112,6 +119,8 @@ json SerializeSettings(const Settings& s)
     j["auto_relaunch"] = s.auto_relaunch;
     j["logging"] = s.logging;
     j["user_stopped"] = s.user_stopped;
+    j["acc_sort_col"] = s.acc_sort_col;
+    j["acc_sort_dir"] = s.acc_sort_dir;
     return j;
 }
 

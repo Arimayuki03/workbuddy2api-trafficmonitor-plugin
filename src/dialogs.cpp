@@ -645,6 +645,8 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             8, 230, 404, 10, 1);
         MkHint(*cp, L"恢复=解除手动停用；「复活」仅对系统自动禁用的账号可用。状态列区分 手动停用/自动禁用 双位。",
             8, 242, 404, 10, 1);
+        MkHint(*cp, L"「清除冷却」强制归零该号冷却/熔断/降权/模型限额（wb2api ≥ v1.10.0），不停用选号；旧版服务端提示不可用。",
+            8, 254, 404, 10, 1);
 
         // —— 页③ 定时任务 ——
         // 表头一行 + 每任务一行：勾选 | 触发时间(可编辑) | 下次 | 上次/状态 | 立即执行 | 应用。
@@ -760,6 +762,11 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
                 AppendMenuW(m, opflag, 1, L"停用（摘出选号池）");
             if (a.disabled)
                 AppendMenuW(m, opflag, 3, L"复活（解自动禁用）");
+            // 清除冷却（wb2api v1.10.0 panel 域端点）：只清"暂时不可用"计时器，
+            // 不碰停用两位，与上面操作正交所以常驻菜单。挂 panel 域（/api/*），与
+            // admin_available 无关——按服务是否在跑置灰，而不是 opflag。
+            UINT ccflag = StateIsOn(sn.state) ? MF_STRING : MF_STRING | MF_GRAYED;
+            AppendMenuW(m, ccflag, 4, L"清除冷却（冷却/熔断/降权/模型限额）");
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
             // 单账户悬浮提示显隐（纯插件本地设置，不依赖 admin）：勾选态反映当前是否显示
             {
@@ -796,6 +803,12 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             case 3:
                 if (sn.admin_available)
                     Worker::Instance().RequestAccountOp(uid, "revive");
+                break;
+            case 4:
+                // panel 域端点，与 admin_available（/admin/tasks 200）无必然关系：
+                // admin 关着而 panel 开着时照样可用，只在服务不可达时兜底拦截。
+                if (StateIsOn(sn.state))
+                    Worker::Instance().RequestClearCooldown(uid);
                 break;
             case 9:
                 SendMessageW(hDlg, WB_APP_SHOWCOSTS, 0, (LPARAM)idx);

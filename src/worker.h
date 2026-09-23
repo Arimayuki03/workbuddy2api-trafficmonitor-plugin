@@ -46,6 +46,9 @@ public:
     // busy 键 "acct:<uid>"：同号操作互斥，不同号可并行。op 按 std::string 值捕获进
     // detached 线程，调用方无需保证实参生命周期。
     bool RequestAccountOp(const std::string& uid, const std::string& op);
+    // 强制清除账号冷却/限流（wb2api v1.10.0 panel 域端点）：服务端把冷却/熔断/连败
+    // 降权/模型级限流表全部归零（不碰手动停用/自动禁用两位）。busy 键沿用 "acct:<uid>"。
+    bool RequestClearCooldown(const std::string& uid);
     bool IsActionBusy(const std::string& key) const;         // "svc"/"credits"/"task:<kind>"/"acct:<uid>"
     // 把实时积分自动刷新周期异步同步到服务端冷却（PATCH /admin/credits-interval，
     // 热生效+写回服务 config.json；服务端区间 60–86400 秒）。动作线程内执行，结果经

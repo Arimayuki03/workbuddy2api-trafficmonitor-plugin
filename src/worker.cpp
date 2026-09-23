@@ -1446,6 +1446,49 @@ bool Worker::RequestAccountOp(const std::string& uid, const std::string& op)
     return true;
 }
 
+// 强制清除账号冷却/限流（wb2api v1.10.0，POST /api/accounts/{uid}/clear-cooldown）。
+// 注意端点在 panel 域（/api/* 别名）而非 /admin：鉴权同源（同一 api_key 的 Bearer），
+// 但路由挂载条件不同——panel.enabled=false（缺省 true，显式关闭才算）时路由不存在；
+// wb2api < v1.10.0 时端点也不存在。两者 404 均为 JSON 信封 {"ok":false,"error":...}，
+// 统一提示"版本过旧或面板未启用"。成功响应 {"ok":true,"cleared":bool}，cleared=false
+// 表示该号本就无可清状态（也算成功）；刷新后的真实冷却态由下一轮 /status 快照带回。
+bool Worker::RequestClearCooldown(const std::string& uid)
+{
+    if (uid.empty()) return false;
+    const std::string key = "acct:" + uid;
+    if (!BeginAct(key)) return false; // 与停用/恢复共用同号互斥（都是"改这个号的状态"）
+    std::thread([this, uid, key] {
+        if (stop_.load()) { EndAct(key); return; }
+        Settings s = SettingsStore::Instance().Get();
+        std::string bearer = SettingsStore::Instance().CurrentApiKey();
+        std::wstring url = WideFormat(L"http://127.0.0.1:%d/api/accounts/%s/clear-cooldown",
+            s.port, Utf8ToWide(uid).c_str());
+        // 空体即可（服务端无入参）；4 秒：loopback 内存操作，纯防卡死。
+        HttpResponse r = HttpJson(L"POST", url, bearer, "{}", 4000);
+        if (stop_.load()) { EndAct(key); return; }
+        std::wstring note;
+        if (r.status == 200) {
+            json j;
+            try { j = json::parse(r.body); } catch (...) {}
+            bool cleared = JBool(j, "cleared");
+            note = cleared ? L"已强制清除冷却/限流（冷却、熔断、连败降权、模型限额全归零）"
+                           : L"该账号当前没有可清除的冷却/限流状态";
+            // 本地快照的冷却字段服务端并不回显，立即置空会造成"快照说了算"与
+            // /status 的竞态显示——交给 RefreshSoon 触发的下一轮 /status 纠正。
+        } else if (r.status == 404) {
+            note = L"清除冷却不可用（wb2api 需 ≥ v1.10.0，或面板未启用：panel.enabled）";
+        } else if (r.status == 401) {
+            note = L"api_key 不符（401）";
+        } else {
+            note = r.err.empty() ? WideFormat(L"操作失败（HTTP %lu）", r.status) : r.err;
+        }
+        if (!note.empty()) Update([&](Snapshot& sn) { NoteLocked(sn, note); });
+        EndAct(key);
+        RefreshSoon();
+    }).detach();
+    return true;
+}
+
 // 把自动刷新周期异步同步到服务端冷却（PATCH /admin/credits-interval，动作线程）。
 // 结果经 action_note 回显；0=关闭自动刷新不下发（服务端区间 60–86400 秒，下发 0 必 400）。
 // 不在 UI 线程同步等结果：服务僵死时一次 PATCH 会把设置窗连同宿主消息泵冻结到超时

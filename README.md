@@ -60,6 +60,7 @@
 - **账户表**：估算积分 / 实时积分（剩余（已用/总量））/ 状态（冷却 · 熔断 · 降权(连败) · 模型限额）/ 令牌剩；双击行弹出该号**每模型实测成本台账**（每1k=实测千 token 均价，≤0 即免费，口径同 wb2api 的 `status-report.ps1`）
 - **实时积分**：经服务端 `POST /admin/credits` 查询，贴服务端冷却节奏；自动刷新周期保存时热写回服务端
 - **账号停用/恢复**：右键账户行——「停用」把该号手动摘出选号池（签到/保活/排程照常，纯对话流量摘除）；「恢复」解除手动停用；「复活」解除系统自动禁用。状态列区分**手动停用 / 自动禁用**双位，停用状态服务端落盘、重启保留
+- **强制清除冷却**（v1.10.0）：右键账户行——「清除冷却」把该号冷却/熔断/连败降权/6004 模型级限流表一键归零（不碰手动停用/自动禁用两位），上游若真仍限流会在下一次请求重新学习；需 wb2api ≥ v1.10.0，旧版提示不可用
 
 ### ⏰ 定时任务
 
@@ -196,6 +197,7 @@ powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1 -TMDir 'E:\软件\Tr
 | ≥ v1.7.0 | 模型用量倍率 | **2026-09-19 上游版**（`/v1/stats` 每模型透出积分倍率 `credits`，上游 5009a1f） | 不显示倍率，其余照常 |
 | ≥ v1.8.0 | 任务队列定时排程 | **2026-09-21 合并版**（调度器第 7 类 `queue` 任务） | 该行不出现 |
 | ≥ v1.9.3 | 触发时间热改 | **2026-09-23 fork 版**（`PATCH /admin/tasks` 支持 `{kind, hours}` + 面板保存配置热应用 `schedule.*_hours`，调度器 `SetHours` 即时重排） | 回退直写 config.json，需重启服务生效 |
+| ≥ v1.10.0 | 强制清除冷却 | **2026-09-24 fork 版**（panel 域 `POST /api/accounts/{uid}/clear-cooldown`，冷却/熔断/连败降权/6004 模型级限流表一键归零） | 菜单置灰项点了提示不可用 |
 
 > 仓库 [Arimayuki03/workbuddy2api](https://github.com/Arimayuki03/workbuddy2api) 已更名为 **[Arimayuki03/workbuddy-cockpit](https://github.com/Arimayuki03/workbuddy-cockpit)**，旧地址由 GitHub 自动重定向，本地已克隆的不需要动 remote。
 

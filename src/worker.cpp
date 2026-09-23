@@ -1468,15 +1468,32 @@ bool Worker::RequestClearCooldown(const std::string& uid)
         if (stop_.load()) { EndAct(key); return; }
         std::wstring note;
         if (r.status == 200) {
+            // 非 JSON 的 200 响应（协议回归）不能落到"无可清状态"的误导提示：
+            // 默认构造的 json 让 JBool 全取 false，与 RequestAccountOp 同样用
+            // parsed 标志区分"成功"与"响应异常"。
             json j;
-            try { j = json::parse(r.body); } catch (...) {}
-            bool cleared = JBool(j, "cleared");
-            note = cleared ? L"已强制清除冷却/限流（冷却、熔断、连败降权、模型限额全归零）"
-                           : L"该账号当前没有可清除的冷却/限流状态";
+            bool parsed = true;
+            try { j = json::parse(r.body); } catch (...) { parsed = false; }
+            if (!parsed) {
+                note = L"操作已下发但响应解析失败（协议异常），等待下轮状态刷新";
+            } else {
+                bool cleared = JBool(j, "cleared");
+                note = cleared ? L"已强制清除冷却/限流（冷却、熔断、连败降权、模型限额全归零）"
+                               : L"该账号当前没有可清除的冷却/限流状态";
+            }
             // 本地快照的冷却字段服务端并不回显，立即置空会造成"快照说了算"与
             // /status 的竞态显示——交给 RefreshSoon 触发的下一轮 /status 纠正。
         } else if (r.status == 404) {
-            note = L"清除冷却不可用（wb2api 需 ≥ v1.10.0，或面板未启用：panel.enabled）";
+            // 两种 404：端点不存在（wb2api < v1.10.0 / panel 未启用，纯文本或无
+            // error 字段）与 uid 失效（快照陈旧、账号已被删，panel 域扁平信封
+            // {"ok":false,"error":"account not found"}）。有 error 文本时优先回显，
+            // 避免"账号不存在"被误导成"请升级服务端"。
+            json j;
+            try { j = json::parse(r.body); } catch (...) {}
+            std::string msg = j.is_object() ? JStr(j, "error") : std::string();
+            note = msg.empty()
+                ? L"清除冷却不可用（wb2api 需 ≥ v1.10.0，或面板未启用：panel.enabled）"
+                : L"清除冷却失败：" + Utf8ToWide(msg);
         } else if (r.status == 401) {
             note = L"api_key 不符（401）";
         } else {

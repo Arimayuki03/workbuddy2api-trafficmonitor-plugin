@@ -16,6 +16,11 @@ enum ShowMode {
     SM_STATE_ONLY = 2,     // 仅点 + 状态短词
 };
 
+// 账户表排序键的合法列上界（dialogs.cpp 的 kAccCols-1，6 列布局）。与
+// acc_sort_col 的解析防呆共用单一来源：列数演进（增删列）时这里与 dialogs.cpp
+// 的列定义同步改，持久化的合法排序不会被解析端误回落成未排序。
+inline constexpr int kAccSortColMax = 5;
+
 struct Settings {
     std::wstring service_dir;                 // wb2api 安装目录（空=未配置；服务页「浏览…」选择）
     int port = 7863;

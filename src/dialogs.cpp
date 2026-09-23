@@ -59,6 +59,9 @@ const wchar_t* kKindZh[KIND_N] = { L"签到", L"猫猫旅行", L"活跃上报", 
 constexpr int kTipCol = 4;
 constexpr int kTokenCol = 5;
 constexpr int kAccCols = 6;
+// 排序键合法上界（settings 持久化解析防呆共用）必须随列数走：删列后 kAccCols-1=5，
+// 断言脱钩时持久化的合法排序会被解析端静默回落 -1。
+static_assert(kAccCols - 1 == kAccSortColMax, "kAccSortColMax 需与账户表列数同步（settings.h）");
 
 int64_t NowSecX() { return static_cast<int64_t>(time(nullptr)); }
 
@@ -146,6 +149,10 @@ struct Ctx {
     // （"sort:%d:%d" 前缀），点击后即使行内容没变，下个 Refresh tick 也必重建。
     int acc_sort_col = -1;
     int acc_sort_dir = 0;
+    // 行序 → uid8 映射：FillAccountList 每次重建列表时按插入顺序 clear+push。
+    // 排序后 ListView 行号 ≠ /status 快照下标，右键菜单/双击台账按行号取 uid8
+    // 再回快照找账号——uid8 是服务端唯一键，消除昵称重名误映射与文本截断两个隐患。
+    std::vector<std::wstring> acc_row_uid8;
     // 页③
     TaskRow task[KIND_N];
     HWND task_warn = nullptr, btn_runall = nullptr, task_note = nullptr;
@@ -449,8 +456,10 @@ void FillAccountList(Ctx& c, const Snapshot& sn)
             [desc](const Row& x, const Row& y) { return SortKeyLess(x.key, y.key, desc); });
 
     ListView_DeleteAllItems(c.acc_list);
+    c.acc_row_uid8.clear();
     for (auto& row : rows) {
         const AccountInfo& a = *row.a;
+        c.acc_row_uid8.push_back(a.uid8); // 行号→uid8 映射与插入顺序严格同步
         LVITEMW it{};
         it.mask = LVIF_TEXT;
         it.iItem = ListView_GetItemCount(c.acc_list);
@@ -896,15 +905,13 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             ScreenToClient(cp->acc_list, &ht.pt);
             int idx = ListView_HitTest(cp->acc_list, &ht);
             Snapshot sn = Worker::Instance().Copy();
-            // 排序后 ListView 行序 ≠ /status 快照下标：按行首昵称+uid8 从快照里找回
-            // 对应账号（FillAccountList 行数据即快照账号本体，昵称唯一性由服务端保证；
-            // 极端重名时退化为"同昵称第一个"，操作仍落在一个真实账号上）。
-            if (idx < 0) return TRUE;
-            wchar_t nick[128] = {};
-            ListView_GetItemText(cp->acc_list, idx, 0, nick, (int)(_countof(nick)));
+            // 排序后 ListView 行号 ≠ /status 快照下标：按 FillAccountList 维护的
+            // 行号→uid8 映射回快照找账号（uid8 是服务端唯一键，不依赖昵称唯一/不截断）。
+            if (idx < 0 || idx >= (int)cp->acc_row_uid8.size()) return TRUE;
+            const std::wstring& uid8 = cp->acc_row_uid8[(size_t)idx];
             const AccountInfo* pa = nullptr;
             for (auto& acc : sn.accounts) {
-                if (acc.nickname == nick) { pa = &acc; break; }
+                if (acc.uid8 == uid8) { pa = &acc; break; }
             }
             if (!pa) return TRUE;
             const AccountInfo& a = *pa;
@@ -969,9 +976,8 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
                     Worker::Instance().RequestClearCooldown(uid);
                 break;
             case 9:
-                // 与双击同一收口：传昵称文本，弹窗处理处按昵称找快照账号
-                SendMessageW(hDlg, WB_APP_SHOWCOSTS, 0,
-                    reinterpret_cast<LPARAM>(std::wstring(a.nickname).c_str()));
+                // 与双击同一收口：传行号，弹窗处理处按 acc_row_uid8 回快照找账号
+                SendMessageW(hDlg, WB_APP_SHOWCOSTS, 0, (LPARAM)idx);
                 break;
             default: break;
             }
@@ -981,27 +987,26 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         // wb2api 上游 2493532 透出）。口径与 wb2api 的 status-report.ps1 一致：
         // 每1k=实测千 token 均价（EMA，≤0 即实测免费），6 小时无观测服务端自动删行。
         if (cp->acc_list && nh->hwndFrom == cp->acc_list && nh->code == LVN_ITEMACTIVATE) {
-            // 排序后行号≠快照下标：直接传行首昵称文本（弹窗处理处按昵称从最新快照找）。
+            // 行号传给 WB_APP_SHOWCOSTS：弹窗处理处按行号取 uid8 回快照找账号
+            // （acc_row_uid8 与列表行严格同步，行号即稳定键）。
             int sel = ListView_GetNextItem(cp->acc_list, -1, LVNI_SELECTED);
             if (sel < 0) return TRUE;
-            wchar_t nick[128] = {};
-            ListView_GetItemText(cp->acc_list, sel, 0, nick, (int)(_countof(nick)));
-            SendMessageW(hDlg, WB_APP_SHOWCOSTS, 0,
-                reinterpret_cast<LPARAM>(std::wstring(nick).c_str()));
+            SendMessageW(hDlg, WB_APP_SHOWCOSTS, 0, (LPARAM)sel);
             return TRUE;
         }
         return FALSE;
     }
     case WB_APP_SHOWCOSTS: {
         if (!cp) return TRUE;
-        // lp = 行首昵称文本指针（LVN_ITEMACTIVATE 处 std::wstring 的 c_str()——
-        // SendMessage 是同步调用，栈上临时存活到处理完）。按昵称从最新快照找回账号：
-        // 排序后行号≠快照下标，昵称是表格行与快照之间唯一的稳定键。
-        const wchar_t* nick = reinterpret_cast<const wchar_t*>(lp);
+        // lp = ListView 行号：按 acc_row_uid8（FillAccountList 维护的行号→uid8 映射）
+        // 取 uid8 再回最新快照找账号——排序后行号≠快照下标，uid8 是唯一稳定键。
+        int idx = (int)lp;
         Snapshot sn = Worker::Instance().Copy();
+        if (idx < 0 || idx >= (int)cp->acc_row_uid8.size()) return TRUE;
+        const std::wstring& uid8 = cp->acc_row_uid8[(size_t)idx];
         const AccountInfo* pa = nullptr;
         for (auto& acc : sn.accounts) {
-            if (acc.nickname == nick) { pa = &acc; break; }
+            if (acc.uid8 == uid8) { pa = &acc; break; }
         }
         if (!pa) return TRUE;
         const AccountInfo& a = *pa;
@@ -1107,10 +1112,14 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
                     std::wstring keep_dir = st.config_dir;
                     bool keep_stopped = st.user_stopped;
                     auto keep_hidden = st.tip_hidden_uids; // 右键菜单可能改过
+                    int keep_sort_col = st.acc_sort_col;   // 列头点击已即时落盘，保存不得
+                    int keep_sort_dir = st.acc_sort_dir;   // 用打开时的陈旧快照覆盖回去
                     st = c.work;
                     st.config_dir = keep_dir;
                     st.user_stopped = keep_stopped;
                     st.tip_hidden_uids = std::move(keep_hidden);
+                    st.acc_sort_col = keep_sort_col;
+                    st.acc_sort_dir = keep_sort_dir;
                 });
                 Worker::Instance().RefreshSoon();
             }

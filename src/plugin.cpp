@@ -45,7 +45,7 @@ const wchar_t* CPluginApp::GetInfo(PluginInfoIndex index)
     case TMI_DESCRIPTION: return L"workbuddy2api 服务状态监控与手动控制（loopback 本地接口）";
     case TMI_AUTHOR: return L"Arima";
     case TMI_COPYRIGHT: return L"MIT License";
-    case TMI_VERSION: return L"1.10.1";
+    case TMI_VERSION: return L"1.10.2";
     case TMI_URL: return L"https://github.com/Arimayuki03/workbuddy2api-trafficmonitor-plugin";
     default: return L"";
     }

@@ -12,10 +12,14 @@ using nlohmann::json;
 namespace {
 
 // 落盘用的原子写：tmp + MOVEFILE_REPLACE_EXISTING（与 wb2api 服务端同风格）。
+// 临时名拼入当前线程 id：worker 线程 SetUserStopped 与 UI 线程列头排序点击都会在
+// 锁外调 Modify 落盘，固定 tmp 名 + 独占打开会让后到者 CreateFileW 直接失败、
+// 丢一次持久化；线程 id 区分并发写方后各写各的 tmp，最终仍靠 REPLACE_EXISTING
+// 原子落到同一目标（后写覆盖先写，属预期）。
 bool WriteFileAtomicW(const std::wstring& path, const std::string& content)
 {
-    std::wstring tmp = path + L".tmp";
-    _wremove(tmp.c_str());
+    std::wstring tmp = WideFormat(L"%s.tmp%lu", path.c_str(), GetCurrentThreadId());
+    _wremove(tmp.c_str()); // 不存在即正常，返回值可忽略
     HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
@@ -149,13 +153,25 @@ void SettingsStore::Init(const std::wstring& config_dir)
         } catch (const std::exception& e) {
             // 坏 json：备份再回落默认，不静默吞掉用户配置
             std::wstring bad = path_ + L".bad";
-            MoveFileExW(path_.c_str(), bad.c_str(), MOVEFILE_REPLACE_EXISTING);
+            // MoveFileExW 可能因 .bad 被占用而失败：此时绝不能继续走到底部用默认
+            // 配置覆盖用户的原 json。raw 还在内存里，退而把原文写进 .bad 保底，
+            // 磁盘上保留用户原文件（内存用默认值即可运行）。
+            if (!MoveFileExW(path_.c_str(), bad.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                if (!WriteFileAtomicW(bad, raw))
+                    LogE(L"settings: 坏 json 备份 .bad 失败，用户原配置保留在磁盘未动");
+                else
+                    LogW(L"settings: 坏 json 备份 .bad 被占用，已将原文写入 .bad");
+                LogW(L"settings: json 解析失败，回落默认配置: " + Utf8ToWide(e.what()));
+                return; // 磁盘保留用户原文件，内存用默认值
+            }
             LogW(L"settings: json 解析失败，已备份为 .bad 并回落默认: " + Utf8ToWide(e.what()));
         }
     }
     cur_.config_dir = config_dir;
     std::string dump = SerializeSettings(cur_).dump(2);
-    WriteFileAtomicW(path_, dump);
+    // 兜底默认配置写回：失败只记日志，不影响内存默认值生效
+    if (!WriteFileAtomicW(path_, dump))
+        LogE(L"settings: 默认配置落盘失败");
 }
 
 Settings SettingsStore::Get() const

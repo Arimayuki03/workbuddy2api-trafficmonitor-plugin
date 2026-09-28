@@ -1,5 +1,6 @@
 // tip_unit.cpp — FitTipBudget/JoinLines/TipUidHidden 单元测试（匿名 namespace 函数，经 include worker.cpp 访问）。
-// Base() 总长 269；预算分档：265=删模型用量区 / 210=再删积分汇总 / 100=只剩骨架。
+// Base() 12 行字符合计 260（手数）：JoinLines 后总长 282（11 个 \r\n），FitTipBudget 的
+// total() 口径（每行+2）= 284。预算分档：265=删模型用量区 / 210=再删积分汇总 / 100=只剩骨架。
 #include "../src/worker.cpp"
 #include <cstdio>
 
@@ -32,8 +33,9 @@ static std::vector<std::wstring> Base()
 
 int main()
 {
-    // 0. 当前预算常量 = 700（与原版完整形态对齐）
+    // 0. 当前预算常量 = 700（与原版完整形态对齐）；Base() 基准长度（手数）：JoinLines 口径
     CHECK(kTipBudget == 700, "kTipBudget == 700");
+    CHECK(JoinLines(Base()).size() == 282, "Base() JoinLines 总长 282");
 
     // 1. 预算内原样保留
     {
@@ -43,7 +45,10 @@ int main()
         CHECK(out.find(L"glm-4.6：12.3分") != std::wstring::npos, "预算内末区明细保留");
         CHECK(out.find(L"…") == std::wstring::npos, "预算内无省略提示");
     }
-    // 2. 预算 265（总长 281 超出）：删尾部模型用量区（明细+标题=46），积分汇总保留
+    // 2. 预算 265（total() 口径基准 284 超出）：删尾部模型用量区。重算（手数）：
+    // 标题 17 + 明细 31 + 各自 +2 → 减量 52（total() 与 JoinLines 两口径恒差 2，
+    // 删相邻两行的减量两口径相同：282→230，JoinLines 50 是算错了）；删后 232 ≤ 265
+    // 收敛；积分汇总保留
     {
         auto lines = Base();
         std::wstring out = FitTipBudget(lines, 265);
@@ -56,7 +61,8 @@ int main()
         CHECK(out.find(L"实时积分：总剩") != std::wstring::npos, "[265] 积分汇总保留");
         CHECK(out.find(L"…") != std::wstring::npos, "[265] 有省略提示");
     }
-    // 3. 预算 210：再删积分汇总（35）→ 200，定时任务保留
+    // 3. 预算 210：删模型用量区后 232 仍超，再删积分汇总（行 35 字符，两口径同减量 37）
+    // → 195 ≤ 210，收敛；定时任务保留
     {
         auto lines = Base();
         std::wstring out = FitTipBudget(lines, 210);

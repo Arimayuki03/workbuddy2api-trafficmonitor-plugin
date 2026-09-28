@@ -45,12 +45,14 @@ extern HMODULE g_hInst; // 资源所在模块（DllMain 赋值）
 namespace wb2::dlg {
 namespace {
 
-// 7 类任务（wb2api 合并版 /admin/tasks）：queue=任务中心执行队列的定时排程，
-// 服务端 queue_enabled 缺省 false（队列对全账号执行真实任务动作链、消耗上游配额，
+// 6 类任务（wb2api v1.15.0 起开学季活动下架：服务端 taskSchool 枚举位保留兼容
+// 老 config，但到点只记"活动已结束"、任务队列不再扫开学季——插件页③/菜单同步
+// 移除该行，动作入口随之下线）。queue=任务中心执行队列的定时排程，服务端
+// queue_enabled 缺省 false（队列对全账号执行真实任务动作链、消耗上游配额，
 // 网页端同为 opt-in），勾选态以服务端快照为准。
-constexpr int KIND_N = 7;
-const char* kKinds[KIND_N] = { "checkin", "travel", "activity", "keepalive", "school", "cat", "queue" };
-const wchar_t* kKindZh[KIND_N] = { L"签到", L"猫猫旅行", L"活跃上报", L"Token保活", L"开学季", L"夜猫子", L"任务队列" };
+constexpr int KIND_N = 6;
+const char* kKinds[KIND_N] = { "checkin", "travel", "activity", "keepalive", "cat", "queue" };
+const wchar_t* kKindZh[KIND_N] = { L"签到", L"猫猫旅行", L"活跃上报", L"Token保活", L"夜猫子", L"任务队列" };
 
 // 账户表列序（v1.10.1 起 6 列，估算列删除——悬浮窗只显实时积分后表格口径一致）：
 // 昵称|域|实时|状态|悬浮窗|令牌剩。
@@ -255,6 +257,13 @@ LRESULT CALLBACK AccListProc(HWND h, UINT msg, WPARAM wp, LPARAM lp,
     // 配合 LVS_EX_DOUBLEBUFFER：重绘先进内存位图再整帧上屏，不会"擦背景→画内容"
     // 两段式交替出现的白闪。只在 ITEMCHANGED（宽度确实变了）后重绘，ITEMCHANGING
     // 每像素拖动会连发多次，多绘无益。
+    //
+    // 竖向滚动（滚轮/拖滑块/键盘，ListView 内部位块搬移实现）同理：滚完后只对底部
+    // 露出的窄条补一次 WM_PAINT，上一帧画在表头下沿的深色线随旧内容被整体搬到
+    // 表头下方滚动量处，成了一条悬在数据区里的多余深色横线。滚动路径多（滚轮不走
+    // WM_VSCROLL），统一在 WM_PAINT 里对比滚动条位置：变了即把更新区扩成整客户区，
+    // 默认绘制整帧重画后，线只出现在表头下沿本来的位置。列表不满一屏没有滚动条
+    // 时 pos 恒 0，不会空转。
     if (msg == WM_NOTIFY) {
         LPNMHEADERW nm = reinterpret_cast<LPNMHEADERW>(lp);
         if (nm && nm->hdr.code == HDN_ITEMCHANGEDW) {
@@ -295,6 +304,21 @@ LRESULT CALLBACK AccListProc(HWND h, UINT msg, WPARAM wp, LPARAM lp,
     }
     LRESULT r = DefSubclassProc(h, msg, wp, lp);
     if (msg == WM_PAINT) {
+        // 滚动检测：topindex 变了说明发生过竖向滚动（滚轮/滑块/键盘），旧帧的表头线
+        // 已被搬进数据区——把更新区扩成整客户区，本次绘制即整帧重画（原因见上）。
+        // 不满一屏没有滚动条时 top 恒 0，不会额外重绘。
+        static int s_last_top = -1;
+        int top = ListView_GetTopIndex(h);
+        if (top != s_last_top) {
+            s_last_top = top;
+            RECT rcAll{};
+            GetClientRect(h, &rcAll);
+            // 先 Validate 再 Invalidate 同一矩形：净效果 = "更新区改为整客户区"。
+            // 不能只 Invalidate——Validate 撤掉原窄条更新区，防止本 WM_PAINT 返回后
+            // 系统再投一次只画窄条的 WM_PAINT（窄条帧又会把已修好的整帧盖掉）。
+            ValidateRect(h, &rcAll);
+            InvalidateRect(h, &rcAll, FALSE);
+        }
         // 表头高度：表头客户区与列表客户区同原点(顶部满宽)，item0 的 bottom 即高度。
         // 不用 HDM_GETITEMHEIGHT——老 SDK 头里没有这个常量，手猜值翻过车。
         RECT hrc{};
@@ -307,10 +331,11 @@ LRESULT CALLBACK AccListProc(HWND h, UINT msg, WPARAM wp, LPARAM lp,
                 RECT rc{};
                 GetClientRect(h, &rc);
                 RECT line{ 0, static_cast<int>(hrc.bottom), rc.right, static_cast<int>(hrc.bottom) + 1 };
+                // static 单色刷进程期常驻（单刷一 GDI 句柄，代价可忽略）：这行线每次
+                // WM_PAINT 都画，Create+Delete 每帧一次纯属浪费。
                 // 100,100,100 ≈ 控件主题边框色，比网格线深两档、比纯黑柔
-                HBRUSH br = CreateSolidBrush(RGB(100, 100, 100));
+                static HBRUSH br = CreateSolidBrush(RGB(100, 100, 100));
                 FillRect(dc, &line, br);
-                DeleteObject(br);
                 ReleaseDC(h, dc);
             }
         }
@@ -439,7 +464,17 @@ void FillAccountList(Ctx& c, const Snapshot& sn)
         case 0: r.key.text = a.nickname; break;
         case 1: r.key.text = a.realm.empty() ? L"cn" : a.realm; break;
         case 2: live_of(a, &r.key.text, &r.key.num); r.key.is_num = true; break;
-        case 3: r.key.text = status_text(a); break;
+        case 3: {
+            // 状态列按"最远到期时刻"数值排序（冷却/熔断/降权/模型限额取 max）：
+            // 文本键会把"冷却至 00:30"排在"冷却至 23:00"后（跨午夜错序）。
+            // 非冷却态（正常/停用/请求中/限额已过）无值统一 -1 垫底保原序；
+            // 单元格文案仍由 status_text 构建，排序键只管排序口径，与展示分离。
+            int64_t nowx = NowSecX();
+            int64_t until = std::max({a.until, a.breaker_until, a.degrade_until, a.rl_until});
+            r.key.is_num = true;
+            r.key.num = until > nowx ? until : -1; // 已过期/无冷却=-1 垫底
+            break;
+        }
         case 4: r.key.text = IsTipHidden(c.tip_hidden_now, a.uid8) ? L"否" : L"是"; break;
         case 5: {
             int64_t days = a.token_expiry > NowSecX() ? (a.token_expiry - NowSecX()) / 86400 : -1;
@@ -459,13 +494,15 @@ void FillAccountList(Ctx& c, const Snapshot& sn)
     c.acc_row_uid8.clear();
     for (auto& row : rows) {
         const AccountInfo& a = *row.a;
-        c.acc_row_uid8.push_back(a.uid8); // 行号→uid8 映射与插入顺序严格同步
         LVITEMW it{};
         it.mask = LVIF_TEXT;
         it.iItem = ListView_GetItemCount(c.acc_list);
         it.pszText = const_cast<LPWSTR>(a.nickname.c_str());
         int r = ListView_InsertItem(c.acc_list, &it);
         if (r < 0) continue;
+        // 插入成功才记账：InsertItem 失败(-1)时行根本不存在，先记账会让映射里多出的
+        // uid8 把后续所有行号整体顶错位，右键/双击按行号取号会打到相邻错误账号。
+        c.acc_row_uid8.push_back(a.uid8); // 行号→uid8 映射与插入顺序严格同步
         auto setcol = [&](int col, const std::wstring& v) {
             ListView_SetItemText(c.acc_list, r, col, const_cast<LPWSTR>(v.c_str()));
         };
@@ -496,7 +533,7 @@ void FitAccountColumnsOnce(Ctx& c)
     RECT rc{};
     GetClientRect(c.acc_list, &rc);
     int total = rc.right - rc.left;
-    if (total <= 0) return; // 页②还没显示过：翻到页②时客户区才有宽
+    if (total <= 0) return; // 客户区宽为 0 仅在 GDI 异常时可达：本函数在 WM_INITDIALOG 建表后立即调用
     // v1.10.1 起估算列删除，释放的宽度留给实时列；kTipCol/kTokenCol 随之前移。
     // 下标 2 = 实时列（吃余量，设计宽 0 单独处理）。数组顺序与 kTipCol/kTokenCol/kAccCols
     // （文件头）及 DlgProc 里 cols[] 建表列序一一对应。
@@ -687,8 +724,6 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         // 让 tab 控件在 WM_PRINTCLIENT 里把自己画进内存位图，采样 tab 显示区
         // 中心一点的像素作为页体真实色。采样失败则回退 COLOR_WINDOW。
         {
-            RECT rc{};
-            TabCtrl_GetItemRect(cp->tab, 0, &rc); // 仅确认 tab 有尺寸，取显示区用 AdjustRect
             RECT disp{ 0, 0, 200, 60 };
             TabCtrl_AdjustRect(cp->tab, FALSE, &disp);
             COLORREF body = CLR_NONE;
@@ -760,9 +795,11 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         SetWindowSubclass(cp->acc_list, AccListProc, 1, 0);
         // 列头点击排序：建表后给表头补 HDS_BUTTONS 样式（MkWnd 的样式参数是 ListView
         // 的；表头样式只能建完再改），并恢复上次会话的排序态（列序号 + 方向）。
+        // 不加 HDS_DRAGDROP：ListView 未开 LVS_EX_HEADERDRAGDROP 时表头自起拖拽循环
+        // 但松手弹回，排序场景纯困惑。保留 HDS_BUTTONS——点击排序需要按压视觉。
         if (HWND hdr0 = ListView_GetHeader(cp->acc_list))
             SetWindowLongPtrW(hdr0, GWL_STYLE,
-                GetWindowLongPtrW(hdr0, GWL_STYLE) | HDS_BUTTONS | HDS_DRAGDROP);
+                GetWindowLongPtrW(hdr0, GWL_STYLE) | HDS_BUTTONS);
         cp->acc_sort_col = cp->work.acc_sort_col;
         cp->acc_sort_dir = cp->work.acc_sort_dir;
         struct Col { LPCWSTR t; int w; };
@@ -807,9 +844,11 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         // 状态列加宽到 172 并把"应用"压到 x=414：旧布局 150 宽度装不下长结果
         // （"ok=0 already=4 fail=0 skipped=0"约 40 字符）被截换行，视觉上像被下一行遮挡。
         // 页面可用宽度 ≈472 DLU（对话框 500 减边框/tab 边距），列宽合计 8+70+44+8+40+8+172+8+44+8+40 ≈ 458。
-        // v1.8.0 加第 7 行 queue（任务队列）后纵向吃紧：tab 显示区高 ≈285 DLU（模板
-        // 298 减表头），行距压到 24、说明区 5 行收进 y=236..280，全部内容 ≤285 不再
-        // 超格（旧布局最后一行 y=292 底边 302，被 tab 显示区裁掉）。
+        // v1.11.0 起开学季行移除（活动下架）：7 行又变 6 行，行距回到 26（末行底边
+        // 184）。说明区与「全部执行」沿用 afdfe88 压缩后的坐标（y=212/214、说明区
+        // 232..274，底边 284 ≤ tab 显示区 ≈285）——行删除省出的 14 DLU 只能留在行区
+        // 与「全部执行」之间：tab 显示区总高不变，整体下移会把末行再次推出可视区
+        // （afdfe88 修的正是 y=292 底边 302 被裁）。
         const struct { LPCWSTR t; int x; int w; } hdr[] = {
             { L"任务", 10, 64 }, { L"触发时间(点)", 82, 46 }, { L"下次", 150, 40 },
             { L"状态(上次结果)", 194, 176 }, { L"", 374, 44 }, { L"", 420, 40 },
@@ -817,7 +856,7 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         for (int k = 0; k < 6; k++) MkLabel(*cp, hdr[k].t, hdr[k].x, 24, hdr[k].w, 10, 2);
         cp->task_warn = MkLabel(*cp, L" ", 8, 8, 404, 10, 2);
         for (int i = 0; i < KIND_N; i++) {
-            int y = 40 + i * 24;
+            int y = 42 + i * 26;
             cp->task[i].chk = MkCheck(*cp, kKindZh[i], 8, y, 70, IDC_TASK_BASE + i * 10, 2);
             // 时间输入框不用 ES_NUMBER：内容是"9,21"逗号分隔小时列表
             cp->task[i].time = MkEdit(*cp, L"-", 82, y - 2, 44, IDC_TASK_BASE + i * 10 + 6, 2);
@@ -832,7 +871,7 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             8, 232, 440, 10, 2);
         MkHint(*cp, L"（旧版服务端无该接口，回退直写文件、重启服务后生效）。", 8, 242, 440, 10, 2);
         MkHint(*cp, L"立即执行在服务进程内跑（与定时任务同一把锁）；状态列显示上次执行结果与耗时。", 8, 254, 440, 10, 2);
-        MkHint(*cp, L"任务队列=扫描全账号待办（成长任务+开学季）并排队执行，消耗上游配额；定时排程默认关，", 8, 264, 440, 10, 2);
+        MkHint(*cp, L"任务队列=扫描全账号待办（成长任务）并排队执行，消耗上游配额；定时排程默认关，", 8, 264, 440, 10, 2);
         MkHint(*cp, L"需勾选启用（同网页端 opt-in 口径）；「立即执行」不等排程、随时可跑一次。", 8, 274, 440, 10, 2);
 
         // —— 页④ 显示 ——

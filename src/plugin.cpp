@@ -12,6 +12,7 @@
 #include <thread>
 #include <algorithm>
 #include <string_view>
+#include <iterator> // std::size（命令分区常量按数组长度派生用）
 
 namespace wb2 {
 
@@ -45,7 +46,7 @@ const wchar_t* CPluginApp::GetInfo(PluginInfoIndex index)
     case TMI_DESCRIPTION: return L"workbuddy2api 服务状态监控与手动控制（loopback 本地接口）";
     case TMI_AUTHOR: return L"Arima";
     case TMI_COPYRIGHT: return L"MIT License";
-    case TMI_VERSION: return L"1.10.2";
+    case TMI_VERSION: return L"1.11.0";
     case TMI_URL: return L"https://github.com/Arimayuki03/workbuddy2api-trafficmonitor-plugin";
     default: return L"";
     }
@@ -71,7 +72,7 @@ const wchar_t* CPluginApp::GetTooltipInfo()
 #endif
     // 出口硬上限：MFC UpdateTipText 对 >1024 字符抛 CInvalidArgException（"遇到不适当的
     // 参数。"），TM 把所有插件的 tooltip 拼成一条，这里无法得知拼接总额，只能保证自己
-    // 永不成为压垮的那段。正常文本经 BuildDisplayLocked 的 kTipBudget(340) 预算已收敛；
+    // 永不成为压垮的那段。正常文本经 BuildDisplayLocked 的 kTipBudget(700) 预算已收敛；
     // 这道闸兜住竞态窗口（设置在两次重建间从折叠切到完整、用户手改 json 等）。1000 留
     // 出宿主自身文本与其它插件的最低生存空间；硬截在出口完成，无状态、无第二次遍历。
     constexpr size_t kTipHardCap = 1000;
@@ -157,28 +158,33 @@ void CPluginApp::EnsureInited()
 // ============================================================================
 namespace {
 
-struct CmdDef {
-    std::wstring name;      // 动态名走 NameOf
-    const char* kind;       // 任务类命令的参数
-    int type;               // 0 启停 1 设置开关 2 立即执行 3 启用开关 4 静态动作
-};
-
-enum CmdType { CT_SVC = 0, CT_SETTING = 1, CT_RUNTASK = 2, CT_TOGGLETASK = 3, CT_STATIC = 4 };
-// 第 7 类 queue=任务队列（wb2api 合并版 /admin/tasks 透出，queue_enabled 缺省 false）。
-const char* kKinds[7] = { "checkin", "travel", "activity", "keepalive", "school", "cat", "queue" };
-const wchar_t* kKindZh[7] = { L"签到", L"旅行", L"活跃", L"保活", L"开学季", L"夜猫子", L"任务队列" };
+// 开学季活动已随 wb2api v1.15.0 下架（到点只记"活动已结束"），菜单同步移除；
+// queue=任务队列（wb2api 合并版 /admin/tasks 透出，queue_enabled 缺省 false）。
+const char* kKinds[6] = { "checkin", "travel", "activity", "keepalive", "cat", "queue" };
+const wchar_t* kKindZh[6] = { L"签到", L"旅行", L"活跃", L"保活", L"夜猫子", L"任务队列" };
 const wchar_t* kSettingZh[3] = { L"开机自启(计划任务)", L"随TrafficMonitor启动", L"意外自动拉起" };
 
-// v1.8.0 加第 7 类任务（任务队列）后菜单扩到 22 项：0启动 1停止 2重启 3设置 4积分 |
-// 5..11 立即执行 | 12..18 启用勾选 | 19..21 开关勾选。开关偏移必须跟着 17→19，
-// 否则勾选"开机自启"实际翻 auto_relaunch、后两项落进未定义区间点了没反应（回归修复）。
-int SettingIndex(int idx) { return idx - 19; }  // 19..21 → 0..2
+// 命令分区基址全部由数组长度派生：加/删任务类命令时只需改 kKinds/kKindZh 数组，
+// 下列常量与所有区间判断自动跟着走——afdfe88 修的正是偏移人肉同步漏改导致的回归，
+// 常量派生 + 编译期锁定让这类笔误过不了编译，而不是等运行时才发现勾选错位。
+constexpr int kCmdActionCount = 5;                                    // 0启动 1停止 2重启 3设置 4积分
+constexpr int kCmdRunBase = kCmdActionCount;                          // 5.. 立即执行
+constexpr int kCmdRunCount = (int)std::size(kKinds);                  // 6
+constexpr int kCmdEnableBase = kCmdRunBase + kCmdRunCount;            // 11.. 启用勾选
+constexpr int kCmdEnableCount = (int)std::size(kKinds);
+constexpr int kCmdSettingBase = kCmdEnableBase + kCmdEnableCount;     // 17.. 开关勾选
+constexpr int kCmdSettingCount = (int)std::size(kSettingZh);          // 3
+constexpr int kCmdTotal = kCmdSettingBase + kCmdSettingCount;         // 20
+static_assert(kCmdTotal == 20, "命令总数与 kKinds/kSettingZh 布局不一致，请核对分区常量");
+
+// 开关命令 → kSettingZh 下标。基址取自 kCmdSettingBase，不再手写数字。
+int SettingIndex(int idx) { return idx - kCmdSettingBase; }  // 17..19 → 0..2
 
 } // namespace
 
-// 布局：0启动 1停止 2重启 3设置 4积分 | 5..11 立即执行(7类) | 12..18 启用勾选(7类) |
-// 19..21 开关勾选。任务页加 queue 行后菜单同步补齐两类命令。
-int CPluginApp::GetCommandCount() { WB2API_TRACE_LOG("GetCommandCount"); return 22; }
+// 布局：0启动 1停止 2重启 3设置 4积分 | 5..10 立即执行(6类) | 11..16 启用勾选(6类) |
+// 17..19 开关勾选。v1.11.0 移除开学季命令后菜单 22→20 项。
+int CPluginApp::GetCommandCount() { WB2API_TRACE_LOG("GetCommandCount"); return kCmdTotal; }
 
 const wchar_t* CPluginApp::GetCommandName(int command_index)
 {
@@ -187,12 +193,12 @@ const wchar_t* CPluginApp::GetCommandName(int command_index)
     // 复用 thread_local 缓冲会让前一条命令名失效。
     static const std::vector<std::wstring> kNames = [] {
         std::vector<std::wstring> v;
-        v.reserve(22);
+        v.reserve(kCmdTotal);
         for (const wchar_t* n : { L"启动服务", L"停止服务", L"重启服务", L"打开设置…", L"查询实时积分" })
             v.push_back(n);
-        for (int i = 0; i < 7; i++) v.push_back(std::wstring(L"立即执行: ") + kKindZh[i]);
-        for (int i = 0; i < 7; i++) v.push_back(std::wstring(L"启用: ") + kKindZh[i]);
-        for (int i = 0; i < 3; i++) v.push_back(kSettingZh[i]);
+        for (int i = 0; i < kCmdRunCount; i++) v.push_back(std::wstring(L"立即执行: ") + kKindZh[i]);
+        for (int i = 0; i < kCmdEnableCount; i++) v.push_back(std::wstring(L"启用: ") + kKindZh[i]);
+        for (int i = 0; i < kCmdSettingCount; i++) v.push_back(kSettingZh[i]);
         return v;
     }();
     if (command_index < 0 || command_index >= static_cast<int>(kNames.size())) return L"";
@@ -202,16 +208,16 @@ const wchar_t* CPluginApp::GetCommandName(int command_index)
 int CPluginApp::IsCommandChecked(int command_index)
 {
     WB2API_TRACE_LOG("IsCommandChecked");
-    if (command_index >= 12 && command_index < 19) {
+    if (command_index >= kCmdEnableBase && command_index < kCmdEnableBase + kCmdEnableCount) {
         Snapshot sn = Worker::Instance().Copy();
         if (!sn.admin_available) return 0;
-        std::string want = kKinds[command_index - 12];
+        std::string want = kKinds[command_index - kCmdEnableBase];
         for (auto& t : sn.tasks)
             if (t.kind == want) return t.enabled ? 1 : 0;
         // queue 服务端缺省 false，其余缺省启用：快照未回时按各自缺省显示
-        return std::string_view(kKinds[command_index - 12]) == "queue" ? 0 : 1;
+        return std::string_view(kKinds[command_index - kCmdEnableBase]) == "queue" ? 0 : 1;
     }
-    if (command_index >= 19 && command_index < 22) {
+    if (command_index >= kCmdSettingBase && command_index < kCmdSettingBase + kCmdSettingCount) {
         Settings s = SettingsStore::Instance().Get();
         switch (SettingIndex(command_index)) {
         case 0: return s.autostart_task ? 1 : 0;
@@ -232,17 +238,18 @@ void CPluginApp::OnPluginCommand(int command_index, void* hWnd, void*)
     else if (command_index == 2) wk.RequestRestartService();
     else if (command_index == 3) OpenSettings(parent);
     else if (command_index == 4) wk.RequestRefreshCredits();
-    else if (command_index >= 5 && command_index < 12) wk.RequestRunTask(kKinds[command_index - 5]);
-    else if (command_index >= 12 && command_index < 19) {
+    else if (command_index >= kCmdRunBase && command_index < kCmdRunBase + kCmdRunCount)
+        wk.RequestRunTask(kKinds[command_index - kCmdRunBase]);
+    else if (command_index >= kCmdEnableBase && command_index < kCmdEnableBase + kCmdEnableCount) {
         // 勾选切换：取反当前状态（服务端为准，动作失败会在快照刷新里回正）
-        std::string want = kKinds[command_index - 12];
+        std::string want = kKinds[command_index - kCmdEnableBase];
         Snapshot sn = wk.Copy();
         bool cur = std::string_view(want) == "queue" ? false : true; // queue 缺省关，其余缺省开
         for (auto& t : sn.tasks)
             if (t.kind == want) cur = t.enabled;
         wk.RequestToggleTask(want, !cur);
     }
-    else if (command_index >= 19 && command_index < 22) {
+    else if (command_index >= kCmdSettingBase && command_index < kCmdSettingBase + kCmdSettingCount) {
         int si = SettingIndex(command_index);
         if (si == 0) {
             // 安装/卸载要走 schtasks（~百毫秒），放后台线程别卡菜单关闭

@@ -89,7 +89,7 @@ struct AccountInfo {
 };
 
 struct TaskInfo {
-    std::string kind;         // checkin/travel/activity/keepalive/school/cat
+    std::string kind;         // checkin/travel/activity/keepalive/school(已下架,枚举位保留)/cat/queue
     std::wstring label;       // 中文名（服务端下发）
     bool enabled = true;
     std::vector<int> hours;

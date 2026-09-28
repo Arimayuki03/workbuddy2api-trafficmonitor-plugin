@@ -167,6 +167,19 @@ int64_t RfcToUnix(const std::string& s)
 
 int64_t NowSec() { return static_cast<int64_t>(time(nullptr)); }
 
+// 服务端 hours 数组与在途提交文本（"9,21" 形态，RequestSetTaskHours 生成）比对：
+// 相等即"快照已追上提交目标值"。轮询线程据此就地了结 pending 标记，不等设置窗
+// 打开来判定——对话框一直关着时，残留标记会遮住 web 端后续的小时表修改。
+bool HoursMatchText(const std::vector<int>& hours, const std::wstring& txt)
+{
+    std::wstring s;
+    for (int hv : hours) {
+        if (!s.empty()) s += L",";
+        s += std::to_wstring(hv);
+    }
+    return !txt.empty() && s == txt;
+}
+
 // hours 热改成功后本地重算"下次触发"显示（HH:mm），让设置窗不等下一轮
 // /admin/tasks 轮询（默认 60 秒）就能立即反映新排程。口径与服务端 nextFire
 // 一致：今天还没过的取今天，过了的取明天最早整点。
@@ -195,9 +208,9 @@ std::wstring NextFireText(const std::vector<int>& hours)
 
 std::wstring KindLabel(const std::string& kind)
 {
-    // 与 wb2api 合并版 kindNames 对齐（checkin/travel/activity/keepalive/school/cat/queue）。
-    // queue=任务中心执行队列的定时排程（网页端任务中心「启动执行队列」的定时版），
-    // 服务端 queue_enabled 缺省 false。
+    // 与 wb2api 合并版 kindNames 对齐（checkin/travel/activity/keepalive/cat/queue；
+    // school 开学季活动已随 wb2api v1.15.0 下架，但服务端枚举位保留——/admin/tasks
+    // 快照仍可能返回该行，保留映射让 tooltip 任务区过滤后仍能正确标注）。
     static const std::map<std::string, std::wstring> m = {
         { "checkin", L"签到" }, { "travel", L"猫猫旅行" }, { "activity", L"活跃上报" },
         { "keepalive", L"Token 保活" }, { "school", L"开学季" }, { "cat", L"夜猫子" },
@@ -633,19 +646,33 @@ void Worker::PollAdmin()
         ti.last_result = Utf8ToWide(JStr(t, "last_result"));
         tasks.push_back(std::move(ti));
     }
-    bool admin_ok = true;
     Update([&](Snapshot& sn) {
-        sn.admin_available = admin_ok;
+        sn.admin_available = true;
         // 在途小时提交跨轮询结转：旧快照里还没了结的 pending_hours 搬进新快照。
         // 对话框在显示时判"快照 hours 已等于 pending"即了结它——快照用旧值回填
         // 窗口关闭；新任务行（服务端新增种类）无在途提交，自然为空。
         std::map<std::string, std::wstring> pend;
         for (auto& t : sn.tasks)
             if (!t.pending_hours.empty()) pend[t.kind] = t.pending_hours;
+        std::map<std::string, std::wstring> pend_nf;
+        for (auto& t : sn.tasks)
+            if (!t.pending_hours.empty() && !t.next_fire.empty()) pend_nf[t.kind] = t.next_fire;
         sn.tasks = std::move(tasks);
         for (auto& t : sn.tasks) {
             auto it = pend.find(t.kind);
-            if (it != pend.end()) t.pending_hours = it->second;
+            if (it == pend.end()) continue;
+            if (HoursMatchText(t.hours, it->second)) {
+                // 快照已追上提交目标：不结转即了结标记（新快照默认无标记），
+                // 不等设置窗打开来判定——对话框一直关着时，残留标记会遮住
+                // web 端后续的小时表修改。
+                continue;
+            }
+            t.pending_hours = it->second;
+            // 在途提交期间服务端热生效的 next_fire（乐观回写）不随旧快照
+            // 回落：旧轮询往返与新 PATCH 竞态时，守住"已按新小时表算出的
+            // 下次触发"直到快照真正追上（hours == pending 即了结标记）。
+            auto nf = pend_nf.find(t.kind);
+            if (nf != pend_nf.end()) t.next_fire = nf->second;
         }
         sn.tasks_ts = (int64_t)time(nullptr);
     });
@@ -927,6 +954,9 @@ void Worker::BuildDisplayLocked()
             if (st.tooltip_tasks) {
                 lines.push_back(L"—— 定时任务 ——");
                 for (auto& t : sn.tasks) {
+                    // 开学季已下架（wb2api v1.15.0）：服务端枚举位保留、快照仍回该行，
+                    // 但任务已不执行，tooltip 不再为它占一行。
+                    if (t.kind == "school") continue;
                     std::wstring mark = t.running ? L"执行中" : (t.enabled ? L"启用" : L"停用");
                     std::wstring nxt = (t.running || !t.enabled || t.next_fire.empty())
                         ? L"" : WideFormat(L" 下次%s", t.next_fire.c_str());
@@ -1113,18 +1143,20 @@ bool Worker::RequestSetTaskHours(const std::string& kind, const std::vector<int>
             std::wstring url = WideFormat(L"http://127.0.0.1:%d/admin/tasks", s.port);
             json body{ { "kind", kind }, { "hours", hours } };
             HttpResponse r = HttpJson(L"PATCH", url, bearer, body.dump(), 8000);
+            if (stop_.load()) { EndAct(key); return; } // 取消后不碰快照/日志，尽快退场
             if (r.status == 200) {
                 note = WideFormat(L"%s 触发时间已热生效（%s 点），并写回 config.json",
                     KindLabel(kind).c_str(), hvtxt.c_str());
-                // 乐观回写快照：不等下一轮 /admin/tasks（默认 60 秒），
-                // 设置窗"下次触发"列立即按新小时表显示。
+                // 乐观回写 next_fire（不等下一轮 /admin/tasks，默认 60 秒），
+                // 但不动 hours / pending_hours：PATCH 200 前发出的旧轮询快照可能
+                // 晚于 200 到达，若提前清了 pending 标记，旧快照会把 hours 回冲成
+                // 旧值且无结转保护（一个轮询周期内输入框闪回旧值）。保留标记走
+                // PollAdmin 结转 + 设置窗判定"快照追上"自然了结——与直写路径一致。
                 std::wstring nf = NextFireText(hours);
                 Update([&](Snapshot& sn) {
                     for (auto& t : sn.tasks) {
                         if (t.kind != kind) continue;
-                        t.hours = hours;
                         t.next_fire = nf;
-                        t.pending_hours.clear(); // 已是目标值，标记了结
                     }
                 });
             } else if (r.status == 401) {
@@ -1142,6 +1174,7 @@ bool Worker::RequestSetTaskHours(const std::string& kind, const std::vector<int>
                 // 一直是旧小时表，标记挡住回填直到快照真追上（服务重启）。
                 std::wstring cfg = s.service_dir + L"\\config.json";
                 std::wstring err = SetTaskHours(cfg, kind + "_hours", hours);
+                if (stop_.load()) { EndAct(key); return; } // 直写含 .bak/.tmp/rename，卸载后同样不碰文件系统
                 if (err.empty()) {
                     note = WideFormat(L"%s 触发时间已写回 config.json（%s 点），重启服务后生效",
                         KindLabel(kind).c_str(), hvtxt.c_str());
@@ -1344,15 +1377,22 @@ bool Worker::RequestRefreshCredits()
         std::wstring note;
         if (r.status == 200) {
             json j;
-            try { j = json::parse(r.body); } catch (...) {}
-            CreditsInfo ci;
-            ParseCreditsJson(j, ci);
-            Update([&](Snapshot& sn) {
-                sn.credits = std::move(ci);
-                NoteLocked(sn, WideFormat(L"实时积分已刷新（总剩 %s）",
-                    FormatThousands(sn.credits.total_remain).c_str()));
-            });
-            note.clear();
+            bool parsed = true;
+            try { j = json::parse(r.body); } catch (...) { parsed = false; }
+            // 非 JSON 的 200（协议回归）不能清空缓存的良好积分数据——与 GET 轮询
+            // 路径（解析失败 return 保旧值）同守卫，只提示等待下轮刷新。
+            if (!parsed) {
+                note = L"积分查询响应解析失败（协议异常），保留上次数据，等待下轮刷新";
+            } else {
+                CreditsInfo ci;
+                ParseCreditsJson(j, ci);
+                Update([&](Snapshot& sn) {
+                    sn.credits = std::move(ci);
+                    NoteLocked(sn, WideFormat(L"实时积分已刷新（总剩 %s）",
+                        FormatThousands(sn.credits.total_remain).c_str()));
+                });
+                note.clear();
+            }
         } else if (r.status == 429) {
             json j; try { j = json::parse(r.body); } catch (...) {}
             int ra = (int)JInt(j, "retry_after_sec", 0);
@@ -1499,9 +1539,9 @@ bool Worker::RequestClearCooldown(const std::string& uid)
         } else {
             note = r.err.empty() ? WideFormat(L"操作失败（HTTP %lu）", r.status) : r.err;
         }
-        if (!note.empty()) Update([&](Snapshot& sn) { NoteLocked(sn, note); });
+        if (!note.empty()) Update([&](Snapshot& sn) { NoteLocked(sn, note); }); // 防御性守卫：当前各分支 note 均非空
         EndAct(key);
-        RefreshSoon();
+        if (!stop_.load()) RefreshSoon(); // 与 RequestSetTaskHours 同型：卸载后只写原子标志无害，但不自增 refresh_flag_
     }).detach();
     return true;
 }

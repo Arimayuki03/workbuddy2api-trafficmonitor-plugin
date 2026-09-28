@@ -7,6 +7,8 @@
 **把 WorkBuddy2API 服务装进 TrafficMonitor 的任务栏 —— 状态、积分、任务、成本，一眼尽览**
 
 [![Release](https://img.shields.io/github/v/release/Arimayuki03/workbuddy2api-trafficmonitor-plugin?style=flat-square&logo=github)](https://github.com/Arimayuki03/workbuddy2api-trafficmonitor-plugin/releases)
+[![Downloads](https://img.shields.io/github/downloads/Arimayuki03/workbuddy2api-trafficmonitor-plugin/total?style=flat-square&logo=github)](https://github.com/Arimayuki03/workbuddy2api-trafficmonitor-plugin/releases)
+[![Last Commit](https://img.shields.io/github/last-commit/Arimayuki03/workbuddy2api-trafficmonitor-plugin/master?style=flat-square&logo=github)](https://github.com/Arimayuki03/workbuddy2api-trafficmonitor-plugin/commits/master)
 [![License](https://img.shields.io/github/license/Arimayuki03/workbuddy2api-trafficmonitor-plugin?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows-blue?style=flat-square&logo=windows&logoColor=white)](https://github.com/zhongyang219/TrafficMonitor)
 [![Host](https://img.shields.io/badge/Host-TrafficMonitor-4C8CBF?style=flat-square)](https://github.com/zhongyang219/TrafficMonitor)
@@ -24,7 +26,7 @@
 
 - **任务栏栏位** — 彩点实时反映服务健康（绿/橙/灰/红），文本可配为 `4/4`（健康/总数）、积分合计或纯状态
 - **悬浮提示** — 账户实时积分、定时任务、按模型用量、成本汇总，可分区开关控制长度
-- **设置窗 5 页** — 服务启停/自启、账户与积分表（含成本台账）、7 类定时任务排程、显示、高级
+- **设置窗 5 页** — 服务启停/自启、账户与积分表（含成本台账）、6 类定时任务排程、显示、高级
 - **插件命令菜单** — 启动/停止/重启、查询实时积分、立即执行任务、一键开关，右键即达
 
 纯 Win32 实现（不依赖 MFC），静态 CRT，产物单文件 DLL；随带官方插件接口头 API v8（1.8.6 实测）与 nlohmann/json v3.11.3（均 vendored）。
@@ -64,7 +66,7 @@
 
 ### ⏰ 定时任务
 
-- 7 类任务独立排程（v1.8.0 起含**任务队列**行，对齐网页端任务中心的"执行队列定时排程"）；勾选=热生效，触发时间可直接编辑并「应用」——写回走服务端 `/admin/tasks` 接口，**免重启热生效**（服务端调度器即时重排定时器）并最小 diff 落盘 config.json（留 .bak）；旧版服务端无该接口时回退直写文件，需重启服务生效
+- 6 类任务独立排程（v1.8.0 起含**任务队列**行，对齐网页端任务中心的"执行队列定时排程"；v1.11.0 起开学季行随服务端下架移除）；勾选=热生效，触发时间可直接编辑并「应用」——写回走服务端 `/admin/tasks` 接口，**免重启热生效**（服务端调度器即时重排定时器）并最小 diff 落盘 config.json（留 .bak）；旧版服务端无该接口时回退直写文件，需重启服务生效
 - 「立即执行」= 服务进程内触发，不等排程；任务队列默认关（对全账号执行真实任务动作链、消耗上游配额，同网页端 opt-in 口径）
 
 ### 📊 用量可观测
@@ -135,7 +137,7 @@
 
 </details>
 
-> 实拍于 v1.2.0（账户昵称与积分明细已打码），v1.6.0–v1.9.0 新增的"悬浮窗"列、任务队列行、倍率显示等在对应版本 Release 说明中有截图。
+> 实拍于早期版本（账户昵称已打码，无敏感信息），新版本界面变化见对应版本 Release 说明。
 
 ## 快速开始
 
@@ -181,7 +183,7 @@ powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1 -TMDir 'E:\软件\Tr
 - **任务栏/主窗口**：彩点=服务状态，文本可配置为 `4/4`（健康/总数）、积分或纯状态；单击栏位打开设置。
 - **设置（5 页）**：服务（目录/端口/启停/自启）、账户与积分（实时列含"剩余（已用/总量）"；状态列区分 冷却/熔断/降权(连败)/模型限额；**双击账户行**弹出该号每模型实测成本台账；**"悬浮窗"列**实时反映该号是否出现在悬浮提示明细里，与右键菜单的"悬浮提示显示此账户"同一份开关）、定时任务（勾选=热生效；触发时间可直接编辑并「应用」——经服务端 `/admin/tasks` 接口**热生效**并写回 config.json，旧版服务端回退直写文件、重启服务后生效；立即执行=服务进程内触发；**任务队列**行见下文）、显示、高级。
 - **插件命令菜单**：启动/停止/重启、查询实时积分、立即执行/启用各类任务（含任务队列）、三个开关。
-- **任务队列**（需服务端 ≥ 2026-09-21 合并版，`admin.enabled`）：对齐网页端任务中心的"执行队列"——扫描全部账号的待办（成长任务 + 开学季闭环）并按账号排队执行。**定时排程默认关**，勾选即热启用并写回 `schedule.queue_enabled`；触发时间默认 10 点（`queue_hours`），可编辑并「应用」写回；「立即执行」不等排程、随时可手动跑一次（撞车 409 提示，与网页端互斥语义一致）。
+- **任务队列**（需服务端 ≥ 2026-09-21 合并版，`admin.enabled`）：对齐网页端任务中心的"执行队列"——扫描全部账号的待办（成长任务）并按账号排队执行。**定时排程默认关**，勾选即热启用并写回 `schedule.queue_enabled`；触发时间默认 10 点（`queue_hours`），可编辑并「应用」写回；「立即执行」不等排程、随时可手动跑一次（撞车 409 提示，与网页端互斥语义一致）。
 - **成本台账**：设置窗页②**双击账户行**，弹出该号每模型实测成本（模型｜每1k均价｜样本｜末次观测）。每1k=实测千 token 均价（EMA，≤0 即实测免费），6 小时无观测服务端自动回收；服务端选号按便宜优先，台账解释"为什么总选它"。
 - **账号停用/恢复/复活**：页②**右键账户行**——详见上文[功能特性](#功能特性)。停用是独立状态位，与签到解冻、冷却到期等自动复活路径互不干扰。
 - **tooltip 控制**：完整展开默认开，硬预算 700 字符（超预算从尾部按区整行舍弃，骨架行必留）；"显示"页可关"定时任务明细"（默认关）/“账户明细”；单账户显隐在页②右键账户行控制。详细预算规则见[已知边界](#已知边界)。
@@ -198,6 +200,7 @@ powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1 -TMDir 'E:\软件\Tr
 | ≥ v1.8.0 | 任务队列定时排程 | **2026-09-21 合并版**（调度器第 7 类 `queue` 任务） | 该行不出现 |
 | ≥ v1.9.3 | 触发时间热改 | **2026-09-23 fork 版**（`PATCH /admin/tasks` 支持 `{kind, hours}` + 面板保存配置热应用 `schedule.*_hours`，调度器 `SetHours` 即时重排） | 回退直写 config.json，需重启服务生效 |
 | ≥ v1.10.0 | 强制清除冷却 | **2026-09-24 fork 版**（panel 域 `POST /api/accounts/{uid}/clear-cooldown`，冷却/熔断/连败降权/6004 模型级限流表一键归零） | 菜单置灰项点了提示不可用 |
+| ≥ v1.11.0 | 开学季下架对齐 | **v1.15.0（2026-09-29）**（开学季活动 2026-09-24 结束下架：调度器到点只记说明、任务队列不再扫开学季；`school` 枚举位保留兼容老 config） | 页③/菜单不再出现开学季项，旧版服务端不受影响 |
 
 > 仓库 [Arimayuki03/workbuddy2api](https://github.com/Arimayuki03/workbuddy2api) 已更名为 **[Arimayuki03/workbuddy-cockpit](https://github.com/Arimayuki03/workbuddy-cockpit)**，旧地址由 GitHub 自动重定向，本地已克隆的不需要动 remote。
 
@@ -223,8 +226,9 @@ powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1 -TMDir 'E:\软件\Tr
 - "模型用量"数据来自服务端 `GET /v1/stats` 的**进程内存聚合**：wb2api 重启即清零，插件只展示"本次运行累计"口径，无法回看历史；旧版服务端 tooltip 静默 30 分钟探测一次，其余时间跳过请求。"在途模型"台账同理是运行态（归零即删行、不落盘）。
 - 插件更新后「插件管理→重新加载」**不会**加载新代码（worker 线程钉住 DLL 映像，重载静默失效），改配置/换 DLL 后请**重启 TM**；部署脚本已做改名式替换，见"部署到 TrafficMonitor"一节。
 - 定时任务勾选的写回会先备份 `config.json.bak`，并只改动目标一行（未知字段/键序保留）。
-- 触发时间（`schedule.*_hours`）修改经服务端 `PATCH /admin/tasks` **热生效**（2026-09 合并版起，免重启）；旧版服务端回退插件直写 config.json，需重启服务生效。`*_enabled` 开关与积分冷却（`/admin/credits-interval`）热生效不受版本影响。
+- 触发时间（`schedule.*_hours`）修改经服务端 `PATCH /admin/tasks` **热生效**（2026-09 合并版起，免重启）；旧版服务端回退插件直写 config.json，需重启服务生效。`*_enabled` 开关与积分冷却（`/admin/credits-interval`）热生效不受版本影响。提交后若恰好有一轮**旧任务快照**晚于 PATCH 响应返回，插件保留"已提交未生效"标记直到快照真追上（小时表一致即了结），期间"下次触发"列也不被旧快照覆盖——不会出现输入框闪回旧值的观感。
 - 小程序成长任务（minichat）刻意**不在**"定时任务"页出现：它不进 wb2api 的 taskKind 枚举、不经 `/admin/tasks` 透出，只能在 wb2api 的启动菜单里手动触发。任务队列（queue）则相反：它**是**调度器第 7 类任务（2026-09-21 合并版起），故 v1.8.0 起在"定时任务"页有独立一行，排程开关缺省 false 与服务端默认一致。
+- **开学季已下架**（wb2api v1.15.0，活动期 2026-09-13~09-24）：服务端 `school` 枚举位保留（兼容老 config 与 `/admin` 热改）但到点只记"活动已结束"、任务队列不再扫开学季。插件 v1.11.0 起页③/命令菜单同步移除开学季项、tooltip 任务明细过滤该行；连着旧版服务端时看不到开学季入口只是 UI 不再提供，手动接口仍通（无副作用）。
 - TM 只拒载 `GetAPIVersion() <= 0` 的插件，**没有**"声明版本与宿主版本比较"的检查。本插件按 v8 头编译，宿主版本更低的 TM 会照常加载，但其不支持的接口（如 v7 以下不调用 `OnInitialize`）静默缺失，表现为部分功能降级；遇到异常请升级 TM。
 - TM 弹"遇到不适当的参数。"错误框是 MFC `CInvalidArgException`：TM 会把**所有插件**的 tooltip 文本拼成一条喂给 `CToolTipCtrl::UpdateTipText`，MFC 对超过 1024 字符的文本抛此异常——多个信息型插件（本插件 + MijiaPower 等）同载时总和越界才弹（栈回溯实测：mfc140u 内 throw，TrafficMonitor.exe 调用链）。
 - v1.6.0 起本插件对自家 tooltip 上**硬预算 700 字符**（`worker.cpp` 的 `kTipBudget`）：完整展开（默认）最多舍弃最末的"模型用量"区，其余显示与未加预算时一致；超预算时从尾部按区整行舍弃（模型用量 → 积分汇总 → 定时任务 → 账户明细），骨架行（状态/地址/健康概要/提示/操作/尾注）必留并补一行"…"。`GetTooltipInfo` 出口另有 1000 字符硬截兜底。悬浮提示的额外控制（设置④"显示"页）：
@@ -241,6 +245,9 @@ powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1 -TMDir 'E:\软件\Tr
 - **更新插件后行为没变**：「插件管理→重新加载」不生效，必须**重启 TrafficMonitor**（原因见上）。
 - **TM 弹"遇到不适当的参数。"**：多个信息型插件 tooltip 总长超 1024 字符，先关本插件的"账户明细"/其他插件的 tooltip 再试；详见[已知边界](#已知边界)。
 - **想看接口调用时序 / 排查宿主弹框**：设环境变量 `WB2API_TRACE=1` 后启动 TM，插件会记录接口调用时序，并把 first-chance 异常（C++ 异常含调用栈）写入追踪日志：默认 `<WB2API_TRACE_DIR>\wb2api_trace.log`（未设该变量则为 TM 当前目录），也可用 `WB2API_TRACE_PATH` 直接指定完整文件路径。普通 Release 产物即支持（运行期开关，无需专用构建），未开启时零开销。
+- **v1.10.3 代码审查修复**（并入 v1.10.2 之后、v1.11.0 之前的连续修复）：对 v1.8.0..v1.10.2 全部变更做了一轮委托式审查（21 项发现，0 critical/high，4 medium 全修）——触发时间热生效的"旧快照回冲"残留窗口已堵（PATCH 200 后保留 pending 标记直到快照真追上，next_fire 乐观值不再被旧轮询覆盖）、动作线程卸载竞态补全（`RequestSetTaskHours` 与直写文件路径补 stop_ 检查）、账户表右键操作打错账号的防御性修复（行号→uid8 映射改为插入成功才记账）、配置并发落盘不再互撞（临时名带线程 id）、实时积分 200 但响应非 JSON 时不再清空良好缓存。
+- **v1.11.0 账户表滚动残影修复**：账户行数超过可视高度、滚动列表后，表头下方出现一条多余的深色横线悬在数据区里（随滚动反复出现）。根因：ListView 竖向滚动用位块搬移复用旧帧像素，而表头下沿那条深色分隔线是每帧绘制后补画的——滚动后它随旧内容被整体搬到表头下方。修法与列宽拖动残影同型：子类过程在 WM_PAINT 里检测可视顶行号变化，变了即整帧重绘，线只出现在表头下沿本来的位置。
+- **v1.11.0 菜单命令分区常量化**：开学季下架后菜单 22→20 项，所有命令分区基址改由数组长度派生（`kCmdRunBase`/`kCmdEnableBase`/`kCmdSettingBase` + `static_assert` 锁总数）——v1.10.2 修过的"开关偏移人肉同步漏改"回归从根上消除，增删任务类命令只需改一处数组，改错过不了编译。
 
 ## 许可
 

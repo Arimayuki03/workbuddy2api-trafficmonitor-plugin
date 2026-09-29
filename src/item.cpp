@@ -32,12 +32,14 @@ const wchar_t* StatusItem::GetItemId() const { return L"WB2API_STATUS"; }
 const wchar_t* StatusItem::GetItemLableText() const { return L"WB2API"; }
 
 // 宽度预留样例：长度必须 >= 对应显示模式下 BuildDisplayLocked 实际产出的任何值
-// （Running 态 "h/t" 最多 "88/88"，积分态最长 "88.8k"/"-88.8k"，其余为短状态词）。
-// 不再混入旧的 "· 8.8k" 合并格式——那会让任务栏栏位常年多出一段空白。
+// （Running 态 "h/t" 最多 "88/88"，积分态最长 "-88.8k"+ 并发两位数，其余为短状态词）。
+// 并发数在积分右侧以纯数字直拼，样例须覆盖它——否则数值变化会引起任务栏宽度抖动。
 const wchar_t* StatusItem::GetItemValueSampleText() const
 {
-    switch (SettingsStore::Instance().Get().show_mode) {
-    case SM_STATE_CREDITS: return L"-88.8k"; // 积分态最长样例（含负号）
+    Settings st = SettingsStore::Instance().Get();
+    switch (st.show_mode) {
+    case SM_STATE_CREDITS:
+        return st.show_concurrency ? L"-88.8k99" : L"-88.8k"; // 积分态最长样例（含负号+并发）
     case SM_STATE_ONLY:    return L"无响应";  // 最长状态词（4 个全角）
     default:               return L"88/88";  // 健康/总数
     }

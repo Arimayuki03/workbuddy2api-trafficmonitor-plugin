@@ -109,6 +109,7 @@ bool SettingsEqual(const Settings& a, const Settings& b)
         a.admin_poll_sec == b.admin_poll_sec &&
         a.credits_refresh_interval_min == b.credits_refresh_interval_min &&
         a.show_mode == b.show_mode && a.show_live_credits == b.show_live_credits &&
+        a.show_concurrency == b.show_concurrency &&
         a.tooltip_full == b.tooltip_full &&
         a.tooltip_accounts == b.tooltip_accounts &&
         a.tooltip_tasks == b.tooltip_tasks &&
@@ -159,8 +160,8 @@ struct Ctx {
     TaskRow task[KIND_N];
     HWND task_warn = nullptr, btn_runall = nullptr, task_note = nullptr;
     // 页④
-    HWND rad[3] = {}, chk_live = nullptr, chk_tipfull = nullptr, chk_tipacc = nullptr,
-        chk_tiptasks = nullptr;
+    HWND rad[3] = {}, chk_live = nullptr, chk_concur = nullptr, chk_tipfull = nullptr,
+        chk_tipacc = nullptr, chk_tiptasks = nullptr;
     // 页⑤
     HWND admin_edt = nullptr, admin_stat = nullptr;
     // 次要说明文字集合：CTLCOLORSTATIC 里统一画灰
@@ -879,23 +880,26 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         cp->rad[1] = MkWnd(*cp, L"BUTTON", L"状态 + 积分（如 5.6k）", BS_AUTORADIOBUTTON | WS_TABSTOP, 0, 8, 24, 220, 10, IDC_RAD_CREDITS, 3);
         cp->rad[2] = MkWnd(*cp, L"BUTTON", L"仅状态词（运行/停止）", BS_AUTORADIOBUTTON | WS_TABSTOP, 0, 8, 40, 220, 10, IDC_RAD_ONLY, 3);
         cp->chk_live = MkCheck(*cp, L"积分优先显示实时值（有缓存时）", 8, 58, 240, IDC_CHK_LIVECRD, 3);
-        cp->chk_tipfull = MkCheck(*cp, L"悬浮提示完整展开（超预算自动省略次要信息）", 8, 74, 340, IDC_CHK_TIPFULL, 3);
-        cp->chk_tipacc = MkCheck(*cp, L"悬浮提示显示账户明细（多插件同载挤占悬浮提示空间时关闭）", 8, 90, 340, IDC_CHK_TIPACC, 3);
+        // v1.12.0：并发数缀在积分右侧（纯数字，如 "5.6k 2"）——只对积分模式生效。
+        cp->chk_concur = MkCheck(*cp, L"积分右侧显示当前并发数（纯数字；仅对积分模式生效）", 8, 74, 340, IDC_CHK_CONCUR, 3);
+        cp->chk_tipfull = MkCheck(*cp, L"悬浮提示完整展开（超预算自动省略次要信息）", 8, 90, 340, IDC_CHK_TIPFULL, 3);
+        cp->chk_tipacc = MkCheck(*cp, L"悬浮提示显示账户明细（多插件同载挤占悬浮提示空间时关闭）", 8, 106, 340, IDC_CHK_TIPACC, 3);
         // v1.7.0：定时任务区默认不进 tooltip（默认值见 settings.h tooltip_tasks）；
         // 需要盯任务触发时刻的在此打开。
-        cp->chk_tiptasks = MkCheck(*cp, L"悬浮提示显示定时任务明细（默认关闭；打开后每任务占一行）", 8, 106, 340, IDC_CHK_TIPTASKS, 3);
+        cp->chk_tiptasks = MkCheck(*cp, L"悬浮提示显示定时任务明细（默认关闭；打开后每任务占一行）", 8, 122, 340, IDC_CHK_TIPTASKS, 3);
         // MkWnd 给所有控件都加了 WS_GROUP，会让每个单选各自成组、点不互相取消；
         // 清掉后两个的 WS_GROUP，让三个 radio（Z 序相邻）构成同一个互斥组；
         // 再清 WS_TABSTOP（标准组语义：仅组首有 Tab 停靠，组内靠方向键移动）。
         for (int i = 1; i < 3; i++)
             SetWindowLongW(cp->rad[i], GWL_STYLE, GetWindowLongW(cp->rad[i], GWL_STYLE) & ~(WS_GROUP | WS_TABSTOP));
-        MkHint(*cp, L"状态点颜色：绿=运行且可用 · 橙=在跑无可用账号 · 灰=已停止 · 红=端口被占/无响应", 8, 124, 404, 10, 3);
-        MkHint(*cp, L"任务栏宽度按最长样例预留；单击任务栏上的本栏位即可打开此设置窗。", 8, 138, 404, 10, 3);
+        MkHint(*cp, L"状态点颜色：绿=运行且可用 · 橙=在跑无可用账号 · 灰=已停止 · 红=端口被占/无响应", 8, 140, 404, 10, 3);
+        MkHint(*cp, L"任务栏宽度按最长样例预留；单击任务栏上的本栏位即可打开此设置窗。", 8, 154, 404, 10, 3);
         if (cp->work.show_mode >= 0 && cp->work.show_mode <= 2)
             SendMessageW(cp->rad[cp->work.show_mode], BM_SETCHECK, BST_CHECKED, 0);
         else
             SendMessageW(cp->rad[0], BM_SETCHECK, BST_CHECKED, 0);
         SendMessageW(cp->chk_live, BM_SETCHECK, cp->work.show_live_credits ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessageW(cp->chk_concur, BM_SETCHECK, cp->work.show_concurrency ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(cp->chk_tipfull, BM_SETCHECK, cp->work.tooltip_full ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(cp->chk_tipacc, BM_SETCHECK, cp->work.tooltip_accounts ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(cp->chk_tiptasks, BM_SETCHECK, cp->work.tooltip_tasks ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -1107,6 +1111,7 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             c.work.auto_relaunch = SendMessageW(c.chk_relaunch, BM_GETCHECK, 0, 0) == BST_CHECKED;
             c.work.logging = SendMessageW(c.chk_log, BM_GETCHECK, 0, 0) == BST_CHECKED;
             c.work.show_live_credits = SendMessageW(c.chk_live, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            c.work.show_concurrency = SendMessageW(c.chk_concur, BM_GETCHECK, 0, 0) == BST_CHECKED;
             c.work.tooltip_full = SendMessageW(c.chk_tipfull, BM_GETCHECK, 0, 0) == BST_CHECKED;
             c.work.tooltip_accounts = SendMessageW(c.chk_tipacc, BM_GETCHECK, 0, 0) == BST_CHECKED;
             c.work.tooltip_tasks = SendMessageW(c.chk_tiptasks, BM_GETCHECK, 0, 0) == BST_CHECKED;

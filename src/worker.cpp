@@ -819,6 +819,13 @@ void Worker::BuildDisplayLocked()
         case SM_STATE_CREDITS: {
             int64_t c = CreditsFor(sn, st, nullptr);
             v = c >= 0 ? FormatCreditsCompact(c) : L"-";
+            // 并发数（纯数字）缀在积分右侧、隔一个空格：/status 各账号 in_flight 求和。
+            // 只在服务可观测（accounts_valid）时显示，无数据不显示 0 误导。
+            if (st.show_concurrency && sn.accounts_valid) {
+                int inflight = 0;
+                for (auto& a : sn.accounts) inflight += a.in_flight;
+                v += WideFormat(L" %d", inflight);
+            }
             break;
         }
         case SM_STATE_ONLY:

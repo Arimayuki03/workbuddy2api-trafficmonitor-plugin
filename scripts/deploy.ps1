@@ -1,6 +1,6 @@
 ﻿# deploy.ps1 — 拷贝编译产物到 TrafficMonitor 的 plugins 目录（改名式替换，TM 运行中也可用）。
 param(
-    [string]$TMDir = 'E:\软件\TrafficMonitor',
+    [string]$TMDir = 'C:\Tools\TrafficMonitor',
     [ValidateSet('Release', 'Debug')]
     [string]$Cfg = 'Release'
 )

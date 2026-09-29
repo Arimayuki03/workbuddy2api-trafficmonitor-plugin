@@ -52,6 +52,7 @@ Settings ParseSettings(const json& j)
     get_int("credits_refresh_interval_min", s.credits_refresh_interval_min);
     get_int("show_mode", s.show_mode);
     get_bool("show_live_credits", s.show_live_credits);
+    get_bool("show_concurrency", s.show_concurrency);
     get_bool("tooltip_full", s.tooltip_full);
     get_bool("tooltip_accounts", s.tooltip_accounts);
     get_bool("tooltip_tasks", s.tooltip_tasks);
@@ -110,6 +111,7 @@ json SerializeSettings(const Settings& s)
     j["credits_refresh_interval_min"] = s.credits_refresh_interval_min;
     j["show_mode"] = s.show_mode;
     j["show_live_credits"] = s.show_live_credits;
+    j["show_concurrency"] = s.show_concurrency;
     j["tooltip_full"] = s.tooltip_full;
     j["tooltip_accounts"] = s.tooltip_accounts;
     j["tooltip_tasks"] = s.tooltip_tasks;

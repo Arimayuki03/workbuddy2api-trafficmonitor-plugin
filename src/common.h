@@ -1,6 +1,6 @@
 // common.h — 全局小工具：编码转换、字符串处理、数值格式化。
 // 约定：进程内边界一律 std::wstring（UTF-16），网络/文件边界一律 UTF-8。
-// workbuddy2api 的 nickname、TrafficMonitor 的中文路径（如 E:\软件\）都在
+// workbuddy2api 的 nickname、TrafficMonitor 安装目录里的中文路径都在
 // 各自边界处显式转换，绝不经过 ANSI 代码页。
 #pragma once
 

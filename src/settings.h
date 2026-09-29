@@ -29,6 +29,7 @@ struct Settings {
     int credits_refresh_interval_min = 0;     // 实时积分自动刷新周期（分钟）；0=仅手动，>=1
     int show_mode = SM_STATE_ACCOUNT;
     bool show_live_credits = true;            // 显示积分时优先用实时缓存
+    bool show_concurrency = false;            // 积分右侧追加当前并发数（/status 各账号 in_flight 求和，纯数字）
     bool tooltip_full = true;                 // tooltip 完整展开（超 700 字符预算自动舍弃次要行）；关闭=折叠为 4 行/~150 字符
     bool tooltip_accounts = true;             // tooltip 显示"账户"区明细行（行内只显实时积分）；关闭可显著缩短 tooltip（多插件同载挤预算时用）
     // 单账户 tooltip 显隐（uid8 列表，落盘）：右键账户行切换。列表内的号不出现在

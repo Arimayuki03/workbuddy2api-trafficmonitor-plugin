@@ -45,14 +45,15 @@ extern HMODULE g_hInst; // 资源所在模块（DllMain 赋值）
 namespace wb2::dlg {
 namespace {
 
-// 6 类任务（wb2api v1.15.0 起开学季活动下架：服务端 taskSchool 枚举位保留兼容
-// 老 config，但到点只记"活动已结束"、任务队列不再扫开学季——插件页③/菜单同步
-// 移除该行，动作入口随之下线）。queue=任务中心执行队列的定时排程，服务端
-// queue_enabled 缺省 false（队列对全账号执行真实任务动作链、消耗上游配额，
-// 网页端同为 opt-in），勾选态以服务端快照为准。
-constexpr int KIND_N = 6;
-const char* kKinds[KIND_N] = { "checkin", "travel", "activity", "keepalive", "cat", "queue" };
-const wchar_t* kKindZh[KIND_N] = { L"签到", L"猫猫旅行", L"活跃上报", L"Token保活", L"夜猫子", L"任务队列" };
+// 6 类任务 + renew（wb2api v1.16.0 新增第 7 类"令牌续期"：对有效期不足
+// pool.expiring_soon 窗口的临期账号主动刷新令牌，schedule.renew_enabled 缺省
+// false opt-in，同 queue 口径）。开学季保持移除：wb2api v1.15.0 起活动下架
+// （school 枚举位保留兼容老 config，但到点只记"活动已结束"）——插件页③/菜单
+// 不给该行，动作入口随之下线。queue=任务中心执行队列的定时排程，对全账号执行
+// 真实任务动作链、消耗上游配额，勾选态以服务端快照为准。
+constexpr int KIND_N = 7;
+const char* kKinds[KIND_N] = { "checkin", "travel", "activity", "keepalive", "cat", "queue", "renew" };
+const wchar_t* kKindZh[KIND_N] = { L"签到", L"猫猫旅行", L"活跃上报", L"Token保活", L"夜猫子", L"任务队列", L"令牌续期" };
 
 // 账户表列序（v1.10.1 起 6 列，估算列删除——悬浮窗只显实时积分后表格口径一致）：
 // 昵称|域|实时|状态|悬浮窗|令牌剩。
@@ -845,11 +846,8 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         // 状态列加宽到 172 并把"应用"压到 x=414：旧布局 150 宽度装不下长结果
         // （"ok=0 already=4 fail=0 skipped=0"约 40 字符）被截换行，视觉上像被下一行遮挡。
         // 页面可用宽度 ≈472 DLU（对话框 500 减边框/tab 边距），列宽合计 8+70+44+8+40+8+172+8+44+8+40 ≈ 458。
-        // v1.11.0 起开学季行移除（活动下架）：7 行又变 6 行，行距回到 26（末行底边
-        // 184）。说明区与「全部执行」沿用 afdfe88 压缩后的坐标（y=212/214、说明区
-        // 232..274，底边 284 ≤ tab 显示区 ≈285）——行删除省出的 14 DLU 只能留在行区
-        // 与「全部执行」之间：tab 显示区总高不变，整体下移会把末行再次推出可视区
-        // （afdfe88 修的正是 y=292 底边 302 被裁）。
+        // v1.16.0 起服务端新增第 7 类 renew（令牌续期）回归 7 行：行距压回 24
+        // （afdfe88 同款，y 起点 42→40），「全部执行」/说明区坐标不用动。
         const struct { LPCWSTR t; int x; int w; } hdr[] = {
             { L"任务", 10, 64 }, { L"触发时间(点)", 82, 46 }, { L"下次", 150, 40 },
             { L"状态(上次结果)", 194, 176 }, { L"", 374, 44 }, { L"", 420, 40 },
@@ -857,7 +855,7 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         for (int k = 0; k < 6; k++) MkLabel(*cp, hdr[k].t, hdr[k].x, 24, hdr[k].w, 10, 2);
         cp->task_warn = MkLabel(*cp, L" ", 8, 8, 404, 10, 2);
         for (int i = 0; i < KIND_N; i++) {
-            int y = 42 + i * 26;
+            int y = 40 + i * 24;
             cp->task[i].chk = MkCheck(*cp, kKindZh[i], 8, y, 70, IDC_TASK_BASE + i * 10, 2);
             // 时间输入框不用 ES_NUMBER：内容是"9,21"逗号分隔小时列表
             cp->task[i].time = MkEdit(*cp, L"-", 82, y - 2, 44, IDC_TASK_BASE + i * 10 + 6, 2);
@@ -872,8 +870,8 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             8, 232, 440, 10, 2);
         MkHint(*cp, L"（旧版服务端无该接口，回退直写文件、重启服务后生效）。", 8, 242, 440, 10, 2);
         MkHint(*cp, L"立即执行在服务进程内跑（与定时任务同一把锁）；状态列显示上次执行结果与耗时。", 8, 254, 440, 10, 2);
-        MkHint(*cp, L"任务队列=扫描全账号待办（成长任务）并排队执行，消耗上游配额；定时排程默认关，", 8, 264, 440, 10, 2);
-        MkHint(*cp, L"需勾选启用（同网页端 opt-in 口径）；「立即执行」不等排程、随时可跑一次。", 8, 274, 440, 10, 2);
+        MkHint(*cp, L"任务队列=扫描全账号待办排队执行、消耗上游配额，默认关需勾选；「立即执行」随时可跑一次。", 8, 264, 440, 10, 2);
+        MkHint(*cp, L"令牌续期=对临期账号主动刷新 Token（wb2api ≥ v1.16.0，默认关）；旧版服务端该行不可用。", 8, 274, 440, 10, 2);
 
         // —— 页④ 显示 ——
         cp->rad[0] = MkWnd(*cp, L"BUTTON", L"状态 + 账号数（如 4/4）", BS_AUTORADIOBUTTON | WS_TABSTOP, 0, 8, 8, 220, 10, IDC_RAD_ACCOUNT, 3);

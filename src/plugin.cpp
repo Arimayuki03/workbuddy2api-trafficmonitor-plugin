@@ -46,7 +46,7 @@ const wchar_t* CPluginApp::GetInfo(PluginInfoIndex index)
     case TMI_DESCRIPTION: return L"workbuddy2api 服务状态监控与手动控制（loopback 本地接口）";
     case TMI_AUTHOR: return L"Arima";
     case TMI_COPYRIGHT: return L"MIT License";
-    case TMI_VERSION: return L"1.12.0";
+    case TMI_VERSION: return L"1.13.0";
     case TMI_URL: return L"https://github.com/Arimayuki03/workbuddy2api-trafficmonitor-plugin";
     default: return L"";
     }
@@ -159,9 +159,10 @@ void CPluginApp::EnsureInited()
 namespace {
 
 // 开学季活动已随 wb2api v1.15.0 下架（到点只记"活动已结束"），菜单同步移除；
-// queue=任务队列（wb2api 合并版 /admin/tasks 透出，queue_enabled 缺省 false）。
-const char* kKinds[6] = { "checkin", "travel", "activity", "keepalive", "cat", "queue" };
-const wchar_t* kKindZh[6] = { L"签到", L"旅行", L"活跃", L"保活", L"夜猫子", L"任务队列" };
+// queue=任务队列、renew=令牌续期（wb2api v1.16.0 起 /admin/tasks 透出，
+// 各自 *_enabled 缺省 false）。
+const char* kKinds[7] = { "checkin", "travel", "activity", "keepalive", "cat", "queue", "renew" };
+const wchar_t* kKindZh[7] = { L"签到", L"旅行", L"活跃", L"保活", L"夜猫子", L"任务队列", L"令牌续期" };
 const wchar_t* kSettingZh[3] = { L"开机自启(计划任务)", L"随TrafficMonitor启动", L"意外自动拉起" };
 
 // 命令分区基址全部由数组长度派生：加/删任务类命令时只需改 kKinds/kKindZh 数组，
@@ -169,21 +170,21 @@ const wchar_t* kSettingZh[3] = { L"开机自启(计划任务)", L"随TrafficMoni
 // 常量派生 + 编译期锁定让这类笔误过不了编译，而不是等运行时才发现勾选错位。
 constexpr int kCmdActionCount = 5;                                    // 0启动 1停止 2重启 3设置 4积分
 constexpr int kCmdRunBase = kCmdActionCount;                          // 5.. 立即执行
-constexpr int kCmdRunCount = (int)std::size(kKinds);                  // 6
-constexpr int kCmdEnableBase = kCmdRunBase + kCmdRunCount;            // 11.. 启用勾选
+constexpr int kCmdRunCount = (int)std::size(kKinds);                  // 7
+constexpr int kCmdEnableBase = kCmdRunBase + kCmdRunCount;            // 12.. 启用勾选
 constexpr int kCmdEnableCount = (int)std::size(kKinds);
-constexpr int kCmdSettingBase = kCmdEnableBase + kCmdEnableCount;     // 17.. 开关勾选
+constexpr int kCmdSettingBase = kCmdEnableBase + kCmdEnableCount;     // 19.. 开关勾选
 constexpr int kCmdSettingCount = (int)std::size(kSettingZh);          // 3
-constexpr int kCmdTotal = kCmdSettingBase + kCmdSettingCount;         // 20
-static_assert(kCmdTotal == 20, "命令总数与 kKinds/kSettingZh 布局不一致，请核对分区常量");
+constexpr int kCmdTotal = kCmdSettingBase + kCmdSettingCount;         // 22
+static_assert(kCmdTotal == 22, "命令总数与 kKinds/kSettingZh 布局不一致，请核对分区常量");
 
 // 开关命令 → kSettingZh 下标。基址取自 kCmdSettingBase，不再手写数字。
 int SettingIndex(int idx) { return idx - kCmdSettingBase; }  // 17..19 → 0..2
 
 } // namespace
 
-// 布局：0启动 1停止 2重启 3设置 4积分 | 5..10 立即执行(6类) | 11..16 启用勾选(6类) |
-// 17..19 开关勾选。v1.11.0 移除开学季命令后菜单 22→20 项。
+// 布局：0启动 1停止 2重启 3设置 4积分 | 5..11 立即执行(7类) | 12..18 启用勾选(7类) |
+// 19..21 开关勾选。v1.11.0 移除开学季命令后菜单 22→20 项；v1.16.0 增 renew 回到 22 项。
 int CPluginApp::GetCommandCount() { WB2API_TRACE_LOG("GetCommandCount"); return kCmdTotal; }
 
 const wchar_t* CPluginApp::GetCommandName(int command_index)
@@ -214,8 +215,9 @@ int CPluginApp::IsCommandChecked(int command_index)
         std::string want = kKinds[command_index - kCmdEnableBase];
         for (auto& t : sn.tasks)
             if (t.kind == want) return t.enabled ? 1 : 0;
-        // queue 服务端缺省 false，其余缺省启用：快照未回时按各自缺省显示
-        return std::string_view(kKinds[command_index - kCmdEnableBase]) == "queue" ? 0 : 1;
+        // queue/renew 服务端缺省 false，其余缺省启用：快照未回时按各自缺省显示
+        std::string_view want_sv = kKinds[command_index - kCmdEnableBase];
+        return (want_sv == "queue" || want_sv == "renew") ? 0 : 1;
     }
     if (command_index >= kCmdSettingBase && command_index < kCmdSettingBase + kCmdSettingCount) {
         Settings s = SettingsStore::Instance().Get();
@@ -244,7 +246,8 @@ void CPluginApp::OnPluginCommand(int command_index, void* hWnd, void*)
         // 勾选切换：取反当前状态（服务端为准，动作失败会在快照刷新里回正）
         std::string want = kKinds[command_index - kCmdEnableBase];
         Snapshot sn = wk.Copy();
-        bool cur = std::string_view(want) == "queue" ? false : true; // queue 缺省关，其余缺省开
+        // queue/renew 服务端缺省关，其余缺省开
+        bool cur = (std::string_view(want) == "queue" || std::string_view(want) == "renew") ? false : true;
         for (auto& t : sn.tasks)
             if (t.kind == want) cur = t.enabled;
         wk.RequestToggleTask(want, !cur);

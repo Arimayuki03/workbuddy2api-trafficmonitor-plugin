@@ -60,6 +60,9 @@ struct AccountInfo {
     std::wstring nickname;
     std::wstring realm;
     int64_t credits = 0;      // /status 估算
+    // 运维备注（wb2api v1.17.0 /status accounts[].note，服务端 state.json 持久化）：
+    // tooltip 账户行缀 [备注原文]，空串不占显示。
+    std::wstring note;
     // 服务端 cooling 标志是"三合一"口径：until（账号级冷却）、breaker_until（熔断）、
     // degrade_until（连败降权，上游 #114）任一未到期即为 true。恢复时刻展示取三者最远。
     bool cooling = false;
@@ -85,7 +88,28 @@ struct AccountInfo {
     // 模型名 → 计数；只含正在请求的模型（服务端归零即删行）。
     std::vector<std::pair<std::wstring, int>> in_flight_models;
     int in_flight = 0;
-    int64_t token_expiry = 0; // 本地 auths 文件扫描（unix 秒；0=未知）
+    int64_t token_expiry = 0;     // 本地 auths 文件扫描（unix 秒；0=未知）
+    // 续期观测（wb2api v1.16.0 /status accounts[]，随第 7 类 renew 任务加入）：
+    // last_renewed=最近一次 Token 续期成功时刻（0=从未/旧版）；renew_last_error
+    // 仅失败时非空（成功续期服务端即清空），非空时 tooltip 账户行缀续期失败提示。
+    int64_t last_renewed = 0;
+    std::wstring renew_last_error;
+};
+
+// 模型锁池行（wb2api v1.16.0 /status 顶层 model_locks，pool.ModelLockView）：
+// 把"哪些 (域,模型) 当前被模型级冷却锁住、锁了几个号、还要锁多久"聚合成全池清单——
+// 与 accounts[].rate_limited_models 的单号视角互补，这是"整个服务对这个模型还能不能选"
+// 的口径。无锁时服务端整体省略该键（不是 null），旧版服务端同样没有。
+struct ModelLockInfo {
+    std::wstring model;
+    std::wstring realm;      // cn | global
+    int total = 0;           // 该域参与选号的账号数（分母）
+    int servable = 0;        // 此刻真正能服务该模型的账号数
+    int locked = 0;          // 因该模型自身冷却被挡的账号数
+    std::wstring state;      // locked=全锁 / starved=全饿(非模型冷却所致) / partial=部分锁
+    int64_t unlock_at = 0;        // 最早解锁时刻（unix 秒；0=无）
+    int64_t fully_unlock_at = 0;  // 全部解锁时刻
+    std::wstring reason;     // 锁因原文（6004/11102）
 };
 
 struct TaskInfo {
@@ -137,6 +161,10 @@ struct Snapshot {
     // in_flight_full：健康但在途名额占满的账号数（账号在此计数里是 healthy，
     // 但 chat 实际选不到它——全占满时 healthz 按 ServableNow 口径仍报 503）。
     int cooling = 0, disabled_n = 0, sticky = 0, in_flight_full = 0;
+    // 模型锁池（wb2api ≥ v1.16.0 /status 顶层 model_locks；空=无锁或旧版服务端）。
+    std::vector<ModelLockInfo> model_locks;
+    // 积分保底线（wb2api ≥ v1.16.0 /status 顶层 credit_floor；0=关或旧版服务端）。
+    int64_t credit_floor = 0;
 
     // /admin/*
     bool admin_available = false;   // /admin/tasks 返回过 200

@@ -208,13 +208,14 @@ std::wstring NextFireText(const std::vector<int>& hours)
 
 std::wstring KindLabel(const std::string& kind)
 {
-    // 与 wb2api 合并版 kindNames 对齐（checkin/travel/activity/keepalive/cat/queue；
+    // 与 wb2api kindNames 对齐（checkin/travel/activity/keepalive/cat/queue/renew；
     // school 开学季活动已随 wb2api v1.15.0 下架，但服务端枚举位保留——/admin/tasks
-    // 快照仍可能返回该行，保留映射让 tooltip 任务区过滤后仍能正确标注）。
+    // 快照仍可能返回该行，保留映射让 tooltip 任务区过滤后仍能正确标注。
+    // renew=令牌续期自 wb2api v1.16.0 加入）。
     static const std::map<std::string, std::wstring> m = {
         { "checkin", L"签到" }, { "travel", L"猫猫旅行" }, { "activity", L"活跃上报" },
         { "keepalive", L"Token 保活" }, { "school", L"开学季" }, { "cat", L"夜猫子" },
-        { "queue", L"任务队列" },
+        { "queue", L"任务队列" }, { "renew", L"令牌续期" },
     };
     auto it = m.find(kind);
     return it == m.end() ? Utf8ToWide(kind) : it->second;
@@ -488,6 +489,25 @@ void Worker::PollOnce()
                 patch.disabled_n = (int)JInt(sj, "disabled");
                 patch.in_flight_full = (int)JInt(sj, "in_flight_full");
                 patch.sticky = (int)JInt(sj, "sticky_sessions");
+                // 模型锁池 + 积分保底（wb2api ≥ v1.16.0 /status 顶层，零回归只增键；
+                // 旧版服务端/无锁时键缺失，解析端保持空值即可）。
+                if (sj.contains("model_locks") && sj["model_locks"].is_array()) {
+                    for (auto& l : sj["model_locks"]) {
+                        if (!l.is_object()) continue;
+                        ModelLockInfo mi;
+                        mi.model = Utf8ToWide(JStr(l, "model"));
+                        mi.realm = Utf8ToWide(JStr(l, "realm"));
+                        mi.total = (int)JInt(l, "total");
+                        mi.servable = (int)JInt(l, "servable");
+                        mi.locked = (int)JInt(l, "locked");
+                        mi.state = Utf8ToWide(JStr(l, "state"));
+                        mi.unlock_at = RfcToUnix(JStr(l, "unlock_at"));
+                        mi.fully_unlock_at = RfcToUnix(JStr(l, "fully_unlock_at"));
+                        mi.reason = Utf8ToWide(JStr(l, "reason"));
+                        patch.model_locks.push_back(std::move(mi));
+                    }
+                }
+                patch.credit_floor = JInt(sj, "credit_floor");
                 if (sj.contains("accounts") && sj["accounts"].is_array()) {
                     for (auto& a : sj["accounts"]) {
                         if (!a.is_object()) continue;
@@ -498,6 +518,8 @@ void Worker::PollOnce()
                         if (ai.nickname.empty()) ai.nickname = ai.uid8;
                         ai.realm = Utf8ToWide(JStr(a, "realm"));
                         ai.credits = JInt(a, "credits");
+                        // 运维备注（wb2api v1.17.0）：服务端持久化，换浏览器/插件重装不丢。
+                        ai.note = Utf8ToWide(JStr(a, "note"));
                         ai.cooling = JBool(a, "cooling");
                         ai.disabled = JBool(a, "disabled");
                         // 运维手动停用位（上游 a20d06f）：与自动禁用并列独立，叠加态分别透出。
@@ -552,6 +574,10 @@ void Worker::PollOnce()
                         }
                         ai.in_flight = (int)JInt(a, "in_flight");
                         ai.uid = uid;
+                        // 续期观测（wb2api ≥ v1.16.0）：last_renewed=最近续期成功；
+                        // renew_last_error 仅失败时非空（成功即被服务端清空）。
+                        ai.last_renewed = RfcToUnix(JStr(a, "last_renewed"));
+                        ai.renew_last_error = Utf8ToWide(JStr(a, "renew_last_error"));
                         patch.accounts.push_back(std::move(ai));
                     }
                     patch.accounts_valid = true;
@@ -571,6 +597,8 @@ void Worker::PollOnce()
             sn.total = patch.total; sn.healthy = patch.healthy;
             sn.cooling = patch.cooling; sn.disabled_n = patch.disabled_n; sn.sticky = patch.sticky;
             sn.in_flight_full = patch.in_flight_full;
+            sn.model_locks = std::move(patch.model_locks);
+            sn.credit_floor = patch.credit_floor;
             if (patch.accounts_valid) {
                 sn.accounts = std::move(patch.accounts); sn.accounts_valid = true;
                 for (auto& a : sn.accounts) {
@@ -877,6 +905,41 @@ void Worker::BuildDisplayLocked()
         if (sn.accounts_valid)
             for (auto& a : sn.accounts) if (a.manual_disabled) manual++;
         if (manual > 0) lines.push_back(WideFormat(L"其中手动停用 %d 个（右键账户行可恢复）", manual));
+        // 积分保底线（wb2api ≥ v1.16.0 credit_floor，0=关或旧版服务端）：低于保底的
+        // 账号不接收费模型。只在开启时占一行字。
+        if (sn.credit_floor > 0)
+            lines.push_back(WideFormat(L"积分保底：%s（低于不接收费模型）",
+                FormatThousands(sn.credit_floor).c_str()));
+        // 模型锁池（wb2api ≥ v1.16.0 /status model_locks）：全池口径的模型可用性——
+        // locked=全锁（换模型或等解锁才有用）、starved=全饿（账号级原因，等一下就好）、
+        // partial=仍有号可服务（省略，单号视角已在账户明细的"模型限额"里）。
+        // 最多 4 行防 tooltip 膨胀（1024 硬限），更多用"共N个"收口；服务端按
+        // 不可用优先排序（locked→starved→partial），直接取前几行即是最佳展示序。
+        if (!sn.model_locks.empty()) {
+            int shown_lock = 0;
+            for (auto& ml : sn.model_locks) {
+                if (ml.state != L"locked" && ml.state != L"starved") continue;
+                if (shown_lock == 0) lines.push_back(L"—— 模型锁池 ——");
+                if (shown_lock >= 4) {
+                    lines.push_back(WideFormat(L"  …共%d个模型被锁", (int)sn.model_locks.size()));
+                    break;
+                }
+                // locked 显示最早解锁时刻（何时值得重试）；starved 无锁钟可看，
+                // 显示"0可用/总数"指明是账号级原因（与模型无关）。
+                std::wstring detail;
+                if (ml.state == L"locked") {
+                    detail = ml.unlock_at > NowSec()
+                        ? WideFormat(L" %s恢复", FormatTimeShort(ml.unlock_at).c_str())
+                        : L"";
+                } else {
+                    detail = WideFormat(L" 可用%d/%d", ml.servable, ml.total);
+                }
+                lines.push_back(WideFormat(L"  %s(%s)%s%s", ml.model.c_str(),
+                    ml.realm.empty() ? L"cn" : ml.realm.c_str(),
+                    ml.state == L"locked" ? L" 全锁" : L" 全饿", detail.c_str()));
+                shown_lock++;
+            }
+        }
     }
     if (!sn.last_error.empty()) lines.push_back(L"提示：" + sn.last_error);
 
@@ -946,6 +1009,15 @@ void Worker::BuildDisplayLocked()
             std::wstring tk;
             if (a.token_expiry > NowSec())
                 tk = WideFormat(L" 令牌剩%lld天", (a.token_expiry - NowSec()) / 86400);
+            // 续期失败（wb2api ≥ v1.16.0 renew_last_error，成功即被服务端清空）：
+            // 有值缀提示；原因原文看面板账号页——tooltip 只需要"这个号续期出过问题"。
+            // 不缀 last_renewed（那是上一次成功的时刻，与失败语义无关）。
+            if (!a.renew_last_error.empty())
+                tk += L" 续期失败";
+            // 运维备注（wb2api ≥ v1.17.0 note）：缀尾不截断，用户自己写的就该完整显示；
+            // FitTipBudget 超预算时整行被裁，与现有账户行同一取舍。
+            if (!a.note.empty())
+                tk += L" [" + a.note + L"]";
             lines.push_back(WideFormat(L"  %s (%s) %s%s%s", a.nickname.c_str(),
                 a.realm.empty() ? L"cn" : a.realm.c_str(),
                 note.c_str(), live.c_str(), tk.c_str()));

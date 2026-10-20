@@ -27,6 +27,7 @@
 #include <ctime>
 #include <algorithm>
 #include <vector>
+#include <cwctype>
 
 // 应用私有消息：把"查看成本台账"从 WM_NOTIFY 与右键菜单两处入口收敛到一个处理点。
 #define WB_APP_SHOWCOSTS (WM_APP + 0x21)
@@ -45,15 +46,16 @@ extern HMODULE g_hInst; // 资源所在模块（DllMain 赋值）
 namespace wb2::dlg {
 namespace {
 
-// 6 类任务 + renew（wb2api v1.16.0 新增第 7 类"令牌续期"：对有效期不足
-// pool.expiring_soon 窗口的临期账号主动刷新令牌，schedule.renew_enabled 缺省
-// false opt-in，同 queue 口径）。开学季保持移除：wb2api v1.15.0 起活动下架
-// （school 枚举位保留兼容老 config，但到点只记"活动已结束"）——插件页③/菜单
-// 不给该行，动作入口随之下线。queue=任务中心执行队列的定时排程，对全账号执行
-// 真实任务动作链、消耗上游配额，勾选态以服务端快照为准。
-constexpr int KIND_N = 7;
-const char* kKinds[KIND_N] = { "checkin", "travel", "activity", "keepalive", "cat", "queue", "renew" };
-const wchar_t* kKindZh[KIND_N] = { L"签到", L"猫猫旅行", L"活跃上报", L"Token保活", L"夜猫子", L"任务队列", L"令牌续期" };
+// 7 类任务 + compensation（wb2api v1.19.2 新增第 9 类"活动补偿"一键领取：
+// schedule.compensation_enabled 缺省 false opt-in；小时表允许为空 = 只手动执行，
+// 与其它任务"空表=误用"的语义不同，页③的解析/提示单独放行）。开学季保持移除：
+// wb2api v1.15.0 起活动下架（school 枚举位保留兼容老 config，但到点只记
+// "活动已结束"）——插件页③/菜单不给该行，动作入口随之下线。
+// queue=任务中心执行队列的定时排程，对全账号执行真实任务动作链、消耗上游配额、
+// 勾选态以服务端快照为准；renew=临期 Token 主动续期（默认关）。
+constexpr int KIND_N = 8;
+const char* kKinds[KIND_N] = { "checkin", "travel", "activity", "keepalive", "cat", "queue", "renew", "compensation" };
+const wchar_t* kKindZh[KIND_N] = { L"签到", L"猫猫旅行", L"活跃上报", L"Token保活", L"夜猫子", L"任务队列", L"令牌续期", L"活动补偿" };
 
 // 账户表列序（v1.10.1 起 6 列，估算列删除——悬浮窗只显实时积分后表格口径一致）：
 // 昵称|域|实时|状态|悬浮窗|令牌剩。
@@ -105,7 +107,9 @@ bool SettingsEqual(const Settings& a, const Settings& b)
     // acc_sort_col/acc_sort_dir 不参与比较：排序在列头点击时已经独立落盘
     // （SettingsStore::Modify），不属于"编辑中设置副本 vs 打开时快照"的 diff 语义，
     // 纳入会让没碰任何输入框的对话框在退出时误报 changed。
-    return a.service_dir == b.service_dir && a.port == b.port &&
+    return a.deploy_mode == b.deploy_mode && a.server_url == b.server_url &&
+        a.api_key == b.api_key && a.auths_dir == b.auths_dir &&
+        a.service_dir == b.service_dir && a.port == b.port &&
         a.poll_interval_sec == b.poll_interval_sec &&
         a.admin_poll_sec == b.admin_poll_sec &&
         a.credits_refresh_interval_min == b.credits_refresh_interval_min &&
@@ -135,9 +139,14 @@ struct Ctx {
     HBRUSH bg_brush = nullptr; // 页体色刷：对话框背景与静态控件共用，消"灰底条阴影"
     // 页①
     HWND state_lbl = nullptr, sub_lbl = nullptr, err_lbl = nullptr, action_lbl = nullptr;
-    HWND dir_edt = nullptr, port_edt = nullptr, poll_edt = nullptr;
+    HWND dir_edt = nullptr, port_edt = nullptr, poll_edt = nullptr, btn_browse = nullptr;
     HWND btn_start = nullptr, btn_stop = nullptr, btn_restart = nullptr;
     HWND chk_auto = nullptr, chk_tm = nullptr, chk_relaunch = nullptr, chk_log = nullptr;
+    // 页① 部署方式（v1.14.0）：本地 / Docker·远程 两套输入控件按模式显隐。
+    HWND chk_docker = nullptr;
+    HWND url_edt = nullptr, key_edt = nullptr, auths_edt = nullptr, btn_auths = nullptr;
+    HWND lbl_dir = nullptr, lbl_port = nullptr, lbl_url = nullptr, lbl_key = nullptr, lbl_auths = nullptr;
+    HWND hint_local = nullptr, hint_docker1 = nullptr, hint_docker2 = nullptr, hint_docker3 = nullptr;
     COLORREF state_color = RGB(120, 120, 120);
     // 页②
     HWND acc_list = nullptr, btn_cred = nullptr, lbl_cool = nullptr, citv_edt = nullptr;
@@ -215,6 +224,30 @@ HWND MkEdit(Ctx& c, LPCWSTR t, int l, int tp, int w, int id, int page, DWORD ext
     // 平边框（WS_BORDER，去掉 CLIENTEDGE 凹陷框）：与纯色页体更协调。
     return MkWnd(c, L"EDIT", t, WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | extra,
         0, l, tp, w, 12, id, page);
+}
+
+// 目录选择（服务目录 / Docker auths 目录共用）。COM 初始化失败要给出反馈，
+// 否则用户点「浏览…」毫无反应；原先两份实现复制在同一文件里，已合并。
+void BrowseForFolder(HWND owner, LPCWSTR title, HWND target)
+{
+    if (!target) return;
+    HRESULT cohr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(cohr)) {
+        MessageBoxW(owner, L"系统文件夹选择器初始化失败（COM），请手动输入路径。",
+            L"浏览文件夹", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    BROWSEINFOW bi{};
+    bi.hwndOwner = owner;
+    bi.lpszTitle = title;
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+    if (pidl) {
+        std::vector<wchar_t> path(MAX_PATH * 4, 0);
+        if (SHGetPathFromIDListW(pidl, path.data())) SetWindowTextW(target, path.data());
+        CoTaskMemFree(pidl);
+    }
+    CoUninitialize();
 }
 
 #ifndef HDM_GETITEMRECT
@@ -359,12 +392,32 @@ int GetInt(HWND h, int dflt)
     return _wtoi(s.c_str());
 }
 
+// 页①按部署方式显隐控件。ShowPage 会把整页控件先全部显示，所以切回页①时必须
+// 再调一次本函数覆盖——否则 Docker 模式下切走再切回会看见本应隐藏的本地控件。
+void ApplyDeployModeUi(Ctx& c)
+{
+    const bool docker = c.work.deploy_mode == DM_DOCKER;
+    auto show = [](HWND h, bool on) { if (h) ShowWindow(h, on ? SW_SHOW : SW_HIDE); };
+    show(c.lbl_dir, !docker); show(c.dir_edt, !docker); show(c.btn_browse, !docker);
+    show(c.lbl_port, !docker); show(c.port_edt, !docker);
+    show(c.btn_start, !docker); show(c.btn_stop, !docker); show(c.btn_restart, !docker);
+    show(c.chk_auto, !docker); show(c.chk_tm, !docker); show(c.chk_relaunch, !docker);
+    show(c.hint_local, !docker);
+    show(c.lbl_url, docker); show(c.url_edt, docker);
+    show(c.lbl_key, docker); show(c.key_edt, docker);
+    show(c.lbl_auths, docker); show(c.auths_edt, docker); show(c.btn_auths, docker);
+    show(c.hint_docker1, docker); show(c.hint_docker2, docker); show(c.hint_docker3, docker);
+    SendMessageW(c.chk_docker, BM_SETCHECK, docker ? BST_CHECKED : BST_UNCHECKED, 0);
+    InvalidateRect(c.dlg, nullptr, TRUE);
+}
+
 void ShowPage(Ctx& c, int idx)
 {
     for (int p = 0; p < 5; p++)
         for (HWND h : c.pages[p])
             ShowWindow(h, p == idx ? SW_SHOW : SW_HIDE);
     c.cur_page = idx;
+    if (idx == 0) ApplyDeployModeUi(c);
 }
 
 // 触发时间编辑框内容："9,21"（纯小时列表，逗号分隔）；无数据 "-"。
@@ -576,15 +629,33 @@ void Refresh(Ctx& c)
     case SvcState::Running:      stxt = L"状态：● 运行中"; c.state_color = RGB(16, 130, 40); break;
     case SvcState::Unservable:   stxt = L"状态：● 运行中（暂无可用账号）"; c.state_color = RGB(215, 130, 0); break;
     case SvcState::Starting:     stxt = L"状态：● 启动中…"; c.state_color = RGB(30, 110, 220); break;
-    case SvcState::Stopped:      stxt = L"状态：○ 已停止"; break;
-    case SvcState::WrongService: stxt = L"状态：✕ 端口被其他程序占用"; c.state_color = RGB(200, 30, 30); break;
-    case SvcState::Dead:         stxt = L"状态：✕ 进程无响应"; c.state_color = RGB(200, 30, 30); break;
+    case SvcState::Stopped:      stxt = (c.work.deploy_mode == DM_DOCKER)
+        ? L"状态：○ 无法连接（Docker/远程）" : L"状态：○ 已停止"; break;
+    case SvcState::WrongService:
+        stxt = c.work.deploy_mode == DM_DOCKER
+            ? L"状态：✕ 服务地址返回的不是 workbuddy2api"
+            : L"状态：✕ 端口被其他程序占用";
+        c.state_color = RGB(200, 30, 30); break;
+    case SvcState::Dead:
+        stxt = c.work.deploy_mode == DM_DOCKER
+            ? L"状态：✕ 服务无响应（Docker/远程）"
+            : L"状态：✕ 进程无响应";
+        c.state_color = RGB(200, 30, 30); break;
     }
     std::wstring st2 = std::wstring(stxt);
     if (sn.pid) st2 += WideFormat(L"（PID %lu）", sn.pid);
     SetWindowTextW(c.state_lbl, st2.c_str());
     InvalidateRect(c.state_lbl, nullptr, TRUE);
-    std::wstring sub = WideFormat(L"地址 http://127.0.0.1:%d", c.work.port);
+    std::wstring sub = L"地址 ";
+    if (c.work.deploy_mode == DM_DOCKER) {
+        // 编辑中还没保存：直接读输入框，切模式后立刻能看出地址填没填，而不是
+        // 暂时回落到本机 127.0.0.1 造成误导。
+        std::wstring u = TrimW(GetText(c.url_edt));
+        sub += u.empty() ? L"(未填写服务地址)" : u;
+        sub += L"  ·  Docker/远程";
+    } else {
+        sub += ServiceBaseUrl(c.work);
+    }
     if (sn.last_ok_ts) sub += L"  ·  最后成功 " + FormatTimeShort(sn.last_ok_ts);
     SetWindowTextW(c.sub_lbl, sub.c_str());
     SetWindowTextW(c.err_lbl, sn.last_error.empty() ? L" " : sn.last_error.c_str());
@@ -595,15 +666,20 @@ void Refresh(Ctx& c)
     bool svc_busy = Worker::Instance().IsActionBusy("svc");
     bool on = StateIsOn(sn.state);
     bool off = sn.state == SvcState::Stopped || sn.state == SvcState::Unknown || sn.state == SvcState::Dead;
-    EnableWindow(c.btn_start, !svc_busy && off);
-    EnableWindow(c.btn_stop, !svc_busy && on);
-    EnableWindow(c.btn_restart, !svc_busy);
+    const bool docker = c.work.deploy_mode == DM_DOCKER;
+    // Docker/远程模式三按钮整体隐藏（ApplyDeployModeUi），这里再置灰一次作双保险：
+    // 防止"切页后控件短暂可见"的窗口期内被点到。
+    EnableWindow(c.btn_start, !docker && !svc_busy && off);
+    EnableWindow(c.btn_stop, !docker && !svc_busy && on);
+    EnableWindow(c.btn_restart, !docker && !svc_busy);
 
     // —— 页② 积分 ——
     bool cred_busy = Worker::Instance().IsActionBusy("credits");
     EnableWindow(c.btn_cred, !cred_busy && on && sn.admin_available && sn.credits.cooldown_until <= NowSecX());
     std::wstring cool;
-    if (!sn.admin_available) cool = L"/admin 未启用：无法查询实时积分（见「定时任务」页提示）";
+    if (!sn.admin_available) cool = sn.admin_forbidden
+        ? L"/admin 远程被拒（仅 loopback）：请用 SSH 隧道映射到本机端口后重试"
+        : L"/admin 未启用：无法查询实时积分（见「定时任务」页提示）";
     else if (sn.credits.cooldown_until > NowSecX())
         cool = WideFormat(L"服务端限频：还差 %lld 秒（上次查询 %s）",
             sn.credits.cooldown_until - NowSecX(), FormatTimeShort(sn.credits.ts).c_str());
@@ -653,8 +729,13 @@ void Refresh(Ctx& c)
 
     // —— 页③ 任务 ——
     std::wstring warn = L" ";
-    if (!sn.admin_available)
-        warn = L"⚠ /admin 未启用：升级 wb2api.exe 并在其 config.json 设 \"admin\":{\"enabled\":true} 后重启服务";
+    if (!sn.admin_available) {
+        // 403 与 404 的排障方向完全不同：前者是 Docker/远程直连撞 loopback 闸，
+        // 后者才是 admin 没开/版本旧。别让 Docker 用户去改一个已经开着的开关。
+        warn = sn.admin_forbidden
+            ? L"⚠ 服务端拒绝远程 /admin（仅 loopback）：请用 SSH 隧道把容器 127.0.0.1:7863 映射到本机，再把服务地址改为隧道端口"
+            : L"⚠ /admin 未启用：升级 wb2api.exe 并在其 config.json 设 \"admin\":{\"enabled\":true} 后重启服务";
+    }
     SetWindowTextW(c.task_warn, warn.c_str());
     for (int i = 0; i < KIND_N; i++) {
         const TaskInfo* t = nullptr;
@@ -663,9 +744,12 @@ void Refresh(Ctx& c)
         bool busy = Worker::Instance().IsActionBusy(std::string("task:") + kKinds[i]);
         if (t) {
             SendMessageW(c.task[i].chk, BM_SETCHECK, t->enabled ? BST_CHECKED : BST_UNCHECKED, 0);
-            std::wstring nxt = t->enabled
-                ? (t->next_fire.empty() ? std::wstring(L"-") : t->next_fire)
-                : std::wstring(L"停用");
+            // 活动补偿的"启用 + 空小时表"是合法态（只手动），显示"仅手动"而不是
+            // 一个孤零零的 "-"——否则看起来像排程没生效。
+            std::wstring nxt;
+            if (!t->enabled) nxt = L"停用";
+            else if (!t->next_fire.empty()) nxt = t->next_fire;
+            else nxt = (kKinds[i] == std::string("compensation")) ? L"仅手动" : L"-";
             SetWindowTextW(c.task[i].next, nxt.c_str());
             std::wstring status;
             if (t->running) status = L"执行中…";
@@ -705,7 +789,9 @@ void Refresh(Ctx& c)
 
     // —— 页⑤ ——
     SetWindowTextW(c.admin_stat,
-        sn.admin_available ? L"/admin：可用" : L"/admin：未检测到（服务未升级或开关未启用）");
+        sn.admin_available ? L"/admin：可用"
+        : (sn.admin_forbidden ? L"/admin：远程被拒（服务端仅接受 loopback；可用 SSH 隧道）"
+            : L"/admin：未检测到（服务未升级或开关未启用）"));
 }
 
 INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
@@ -759,28 +845,50 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         // 标签右对齐到 x=50，输入框统一从 x=54 起（DLU），行距 20。
         cp->state_lbl = MkLabel(*cp, L"状态：未知", 8, 6, 404, 10, 0);
         cp->sub_lbl = MkLabel(*cp, L"", 8, 20, 404, 10, 0);
-        MkLabel(*cp, L"服务目录:", 8, 42, 42, 10, 0);
-        cp->dir_edt = MkEdit(*cp, cp->work.service_dir.c_str(), 54, 40, 280, IDC_EDT_DIR, 0);
-        MkBtn(*cp, L"浏览…", 338, 40, 46, 14, IDC_BTN_BROWSE, 0);
-        MkLabel(*cp, L"端口:", 8, 62, 42, 10, 0);
-        cp->port_edt = MkEdit(*cp, std::to_wstring(cp->work.port).c_str(), 54, 60, 40, IDC_EDT_PORT, 0, ES_NUMBER);
-        MkLabel(*cp, L"轮询秒:", 100, 62, 40, 10, 0);
-        cp->poll_edt = MkEdit(*cp, std::to_wstring(cp->work.poll_interval_sec).c_str(), 142, 60, 40, IDC_EDT_POLL, 0, ES_NUMBER);
-        MkHint(*cp, L"鉴权自动读服务目录 config.json 的 api_key，无需在此填写。轮询 ≥10 秒（/status 免费，无风控压力）。",
-            8, 76, 404, 10, 0);
-        cp->btn_start = MkBtn(*cp, L"启动服务", 8, 92, 60, 14, IDC_BTN_START, 0);
-        cp->btn_stop = MkBtn(*cp, L"停止服务", 74, 92, 60, 14, IDC_BTN_STOP, 0);
-        cp->btn_restart = MkBtn(*cp, L"重启服务", 140, 92, 60, 14, IDC_BTN_RESTART, 0);
-        cp->chk_auto = MkCheck(*cp, L"开机自动启动（计划任务，登录+10秒延迟）", 8, 114, 250, IDC_CHK_AUTOSTART, 0);
-        cp->chk_tm = MkCheck(*cp, L"随 TrafficMonitor 启动时拉起", 8, 128, 200, IDC_CHK_TM, 0);
-        cp->chk_relaunch = MkCheck(*cp, L"意外停止自动拉起（10 分钟最多 3 次）", 8, 142, 250, IDC_CHK_RELAUNCH, 0);
-        cp->chk_log = MkCheck(*cp, L"调试日志（写插件配置目录）", 8, 156, 200, IDC_CHK_LOG, 0);
+        // 部署方式一行：左侧模式勾选，右侧轮询秒（两种模式共用）。Docker 模式只
+        // 对接地址，不启动本地进程——这是"不启动本地服务"诉求的开关。
+        cp->chk_docker = MkCheck(*cp, L"Docker/远程部署（对接容器地址，不启停本地服务）", 8, 40, 300, IDC_CHK_DOCKER, 0);
+        MkLabel(*cp, L"轮询秒:", 318, 42, 40, 10, 0);
+        cp->poll_edt = MkEdit(*cp, std::to_wstring(cp->work.poll_interval_sec).c_str(), 360, 40, 34, IDC_EDT_POLL, 0, ES_NUMBER);
+
+        // —— 本地模式控件 ——
+        cp->lbl_dir = MkLabel(*cp, L"服务目录:", 8, 62, 42, 10, 0);
+        cp->dir_edt = MkEdit(*cp, cp->work.service_dir.c_str(), 54, 60, 280, IDC_EDT_DIR, 0);
+        cp->btn_browse = MkBtn(*cp, L"浏览…", 338, 60, 46, 14, IDC_BTN_BROWSE, 0);
+        cp->lbl_port = MkLabel(*cp, L"端口:", 8, 82, 42, 10, 0);
+        cp->port_edt = MkEdit(*cp, std::to_wstring(cp->work.port).c_str(), 54, 80, 40, IDC_EDT_PORT, 0, ES_NUMBER);
+        cp->hint_local = MkHint(*cp, L"鉴权自动读服务目录 config.json 的 api_key，无需在此填写。轮询 ≥10 秒（/status 免费，无风控压力）。",
+            8, 96, 404, 10, 0);
+        cp->btn_start = MkBtn(*cp, L"启动服务", 8, 112, 60, 14, IDC_BTN_START, 0);
+        cp->btn_stop = MkBtn(*cp, L"停止服务", 74, 112, 60, 14, IDC_BTN_STOP, 0);
+        cp->btn_restart = MkBtn(*cp, L"重启服务", 140, 112, 60, 14, IDC_BTN_RESTART, 0);
+        cp->chk_auto = MkCheck(*cp, L"开机自动启动（计划任务，登录+10秒延迟）", 8, 134, 250, IDC_CHK_AUTOSTART, 0);
+        cp->chk_tm = MkCheck(*cp, L"随 TrafficMonitor 启动时拉起", 8, 148, 200, IDC_CHK_TM, 0);
+        cp->chk_relaunch = MkCheck(*cp, L"意外停止自动拉起（10 分钟最多 3 次）", 8, 162, 250, IDC_CHK_RELAUNCH, 0);
+
+        // —— Docker/远程模式控件（与本地控件同坐标叠放，按模式显隐）——
+        cp->lbl_url = MkLabel(*cp, L"服务地址:", 8, 62, 42, 10, 0);
+        cp->url_edt = MkEdit(*cp, cp->work.server_url.c_str(), 54, 60, 280, IDC_EDT_URL, 0);
+        cp->lbl_key = MkLabel(*cp, L"API Key:", 8, 82, 42, 10, 0);
+        // 密钥默认遮挡：设置窗被截图/录屏/旁人旁观时不至于直接泄露。
+        cp->key_edt = MkEdit(*cp, Utf8ToWide(cp->work.api_key).c_str(), 54, 80, 280, IDC_EDT_KEY, 0, ES_PASSWORD);
+        cp->lbl_auths = MkLabel(*cp, L"auths目录:", 8, 102, 42, 10, 0);
+        cp->auths_edt = MkEdit(*cp, cp->work.auths_dir.c_str(), 54, 100, 280, IDC_EDT_AUTHS, 0);
+        cp->btn_auths = MkBtn(*cp, L"浏览…", 338, 100, 46, 14, IDC_BTN_AUTHS, 0);
+        cp->hint_docker1 = MkHint(*cp, L"Docker/远程：填容器映射地址（如 https://192.168.1.10:7863）；API Key 手动填写（服务端 config.json 的 api_key）。",
+            8, 118, 404, 10, 0);
+        cp->hint_docker2 = MkHint(*cp, L"本模式不启停本地服务；/admin 仅服务端 loopback 可调（Docker 端口映射也不是 loopback），任务/实时积分请用 SSH 隧道。",
+            8, 130, 404, 10, 0);
+        cp->hint_docker3 = MkHint(*cp, L"http 会明文发送 API Key，跨主机建议 https 或 SSH 隧道；auths 目录可留空。",
+            8, 142, 404, 10, 0);
+
+        cp->chk_log = MkCheck(*cp, L"调试日志（写插件配置目录）", 8, 176, 200, IDC_CHK_LOG, 0);
         SendMessageW(cp->chk_auto, BM_SETCHECK, cp->work.autostart_task ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(cp->chk_tm, BM_SETCHECK, cp->work.start_with_tm ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(cp->chk_relaunch, BM_SETCHECK, cp->work.auto_relaunch ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(cp->chk_log, BM_SETCHECK, cp->work.logging ? BST_CHECKED : BST_UNCHECKED, 0);
-        cp->err_lbl = MkLabel(*cp, L" ", 8, 174, 404, 10, 0);
-        cp->action_lbl = MkLabel(*cp, L" ", 8, 188, 404, 10, 0);
+        cp->err_lbl = MkLabel(*cp, L" ", 8, 200, 404, 10, 0);
+        cp->action_lbl = MkLabel(*cp, L" ", 8, 214, 404, 10, 0);
 
         // —— 页② 账户与积分 ——
         // 列宽一次性预设（见 FitAccountColumnsOnce）：建表时按客户区宽定死，之后
@@ -846,32 +954,35 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         // 状态列加宽到 172 并把"应用"压到 x=414：旧布局 150 宽度装不下长结果
         // （"ok=0 already=4 fail=0 skipped=0"约 40 字符）被截换行，视觉上像被下一行遮挡。
         // 页面可用宽度 ≈472 DLU（对话框 500 减边框/tab 边距），列宽合计 8+70+44+8+40+8+172+8+44+8+40 ≈ 458。
-        // v1.16.0 起服务端新增第 7 类 renew（令牌续期）回归 7 行：行距压回 24
-        // （afdfe88 同款，y 起点 42→40），「全部执行」/说明区坐标不用动。
+        // v1.14.0 起服务端新增第 9 类 compensation（活动补偿）回到 8 行：行距压到
+        // 21（7 行×24 时代行高更松），「全部执行」与说明区整体上移，最后一层说明
+        // 仍落在 278 DLU 页高之内。
         const struct { LPCWSTR t; int x; int w; } hdr[] = {
             { L"任务", 10, 64 }, { L"触发时间(点)", 82, 46 }, { L"下次", 150, 40 },
             { L"状态(上次结果)", 194, 176 }, { L"", 374, 44 }, { L"", 420, 40 },
         };
-        for (int k = 0; k < 6; k++) MkLabel(*cp, hdr[k].t, hdr[k].x, 24, hdr[k].w, 10, 2);
+        for (int k = 0; k < 6; k++) MkLabel(*cp, hdr[k].t, hdr[k].x, 22, hdr[k].w, 10, 2);
         cp->task_warn = MkLabel(*cp, L" ", 8, 8, 404, 10, 2);
         for (int i = 0; i < KIND_N; i++) {
-            int y = 40 + i * 24;
+            int y = 38 + i * 21;
             cp->task[i].chk = MkCheck(*cp, kKindZh[i], 8, y, 70, IDC_TASK_BASE + i * 10, 2);
-            // 时间输入框不用 ES_NUMBER：内容是"9,21"逗号分隔小时列表
+            // 时间输入框不用 ES_NUMBER：内容是"9,21"逗号分隔小时列表；空表显示 "-"
             cp->task[i].time = MkEdit(*cp, L"-", 82, y - 2, 44, IDC_TASK_BASE + i * 10 + 6, 2);
             cp->task[i].next = MkLabel(*cp, L"-", 150, y, 40, 10, 2);
             cp->task[i].status = MkLabel(*cp, L"-", 194, y, 176, 10, 2);
             cp->task[i].btn = MkBtn(*cp, L"立即执行", 374, y - 2, 44, 14, IDC_TASK_BASE + i * 10 + 5, 2);
             cp->task[i].apply = MkBtn(*cp, L"应用", 420, y - 2, 40, 14, IDC_TASK_BASE + i * 10 + 7, 2);
         }
-        cp->btn_runall = MkBtn(*cp, L"全部执行", 8, 212, 60, 14, IDC_BTN_RUNALL, 2);
-        cp->task_note = MkLabel(*cp, L"", 76, 214, 390, 10, 2);
-        MkHint(*cp, L"触发时间=24 小时制小时列表（逗号分隔，如 9,21）；「应用」经 /admin 接口热生效并写回服务 config.json",
-            8, 232, 440, 10, 2);
-        MkHint(*cp, L"（旧版服务端无该接口，回退直写文件、重启服务后生效）。", 8, 242, 440, 10, 2);
-        MkHint(*cp, L"立即执行在服务进程内跑（与定时任务同一把锁）；状态列显示上次执行结果与耗时。", 8, 254, 440, 10, 2);
-        MkHint(*cp, L"任务队列=扫描全账号待办排队执行、消耗上游配额，默认关需勾选；「立即执行」随时可跑一次。", 8, 264, 440, 10, 2);
-        MkHint(*cp, L"令牌续期=对临期账号主动刷新 Token（wb2api ≥ v1.16.0，默认关）；旧版服务端该行不可用。", 8, 274, 440, 10, 2);
+        cp->btn_runall = MkBtn(*cp, L"全部执行", 8, 204, 60, 14, IDC_BTN_RUNALL, 2);
+        cp->task_note = MkLabel(*cp, L"", 76, 206, 390, 10, 2);
+        MkHint(*cp, L"触发时间=小时列表（逗号分隔，如 9,21）；「应用」经 /admin 热生效并写回 config.json（旧版回退直写，重启生效）。",
+            8, 222, 440, 10, 2);
+        MkHint(*cp, L"立即执行在服务进程内跑；状态列显示上次结果与耗时。任务队列/令牌续期/活动补偿默认关。",
+            8, 234, 440, 10, 2);
+        MkHint(*cp, L"活动补偿（wb2api ≥ v1.19.2）小时留空或填 - = 仅手动执行，不自动领；旧版服务端该行不可用。",
+            8, 246, 440, 10, 2);
+        MkHint(*cp, L"勾选=即时热生效并写回 config.json；任务队列会消耗上游配额，按需开启。",
+            8, 258, 440, 10, 2);
 
         // —— 页④ 显示 ——
         cp->rad[0] = MkWnd(*cp, L"BUTTON", L"状态 + 账号数（如 4/4）", BS_AUTORADIOBUTTON | WS_TABSTOP, 0, 8, 8, 220, 10, IDC_RAD_ACCOUNT, 3);
@@ -1099,7 +1210,15 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         if (id != IDOK && id != IDCANCEL && code != BN_CLICKED) return TRUE;
         switch (id) {
         case IDOK: {
-            c.work.service_dir = TrimW(GetText(c.dir_edt));
+            c.work.deploy_mode = SendMessageW(c.chk_docker, BM_GETCHECK, 0, 0) == BST_CHECKED
+                ? DM_DOCKER : DM_LOCAL;
+            // 目录/URL/密钥归一与 settings.cpp 的解析共用同一份实现：
+            // 避免"保存时一套口径、重启解析另一套"（引号、协议、尾斜杠边界）。
+            c.work.service_dir = NormalizeLocalDir(GetText(c.dir_edt));
+            const std::wstring raw_url = TrimW(GetText(c.url_edt));
+            c.work.server_url = NormalizeServiceUrl(raw_url);
+            c.work.api_key = SanitizeApiKey(WideToUtf8(TrimW(GetText(c.key_edt))));
+            c.work.auths_dir = NormalizeLocalDir(GetText(c.auths_edt));
             c.work.port = GetInt(c.port_edt, 7863);
             c.work.poll_interval_sec = GetInt(c.poll_edt, 30);
             c.work.admin_poll_sec = GetInt(c.admin_edt, 60);
@@ -1108,6 +1227,13 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             c.work.start_with_tm = SendMessageW(c.chk_tm, BM_GETCHECK, 0, 0) == BST_CHECKED;
             c.work.auto_relaunch = SendMessageW(c.chk_relaunch, BM_GETCHECK, 0, 0) == BST_CHECKED;
             c.work.logging = SendMessageW(c.chk_log, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            // Docker/远程：本机没有服务进程，三项本地拉起能力一并清零（随后
+            // autostart diff 会卸载已注册的计划任务）。切回本地模式时再手动勾。
+            if (c.work.deploy_mode == DM_DOCKER) {
+                c.work.autostart_task = false;
+                c.work.start_with_tm = false;
+                c.work.auto_relaunch = false;
+            }
             c.work.show_live_credits = SendMessageW(c.chk_live, BM_GETCHECK, 0, 0) == BST_CHECKED;
             c.work.show_concurrency = SendMessageW(c.chk_concur, BM_GETCHECK, 0, 0) == BST_CHECKED;
             c.work.tooltip_full = SendMessageW(c.chk_tipfull, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -1116,11 +1242,24 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             c.work.show_mode = SendMessageW(c.rad[0], BM_GETCHECK, 0, 0) == BST_CHECKED ? SM_STATE_ACCOUNT
                 : (SendMessageW(c.rad[1], BM_GETCHECK, 0, 0) == BST_CHECKED ? SM_STATE_CREDITS : SM_STATE_ONLY);
             std::wstring bad;
-            if (c.work.service_dir.empty()) bad = L"服务目录不能为空";
-            else if (c.work.port <= 0 || c.work.port > 65535) bad = L"端口非法";
-            else if (c.work.poll_interval_sec < 10 || c.work.poll_interval_sec > 600) bad = L"轮询间隔需 10–600 秒";
-            else if (c.work.admin_poll_sec < 15 || c.work.admin_poll_sec > 600) bad = L"管理轮询需 15–600 秒";
-            else if (c.work.credits_refresh_interval_min < 0 || c.work.credits_refresh_interval_min > 1440)
+            if (c.work.deploy_mode == DM_DOCKER) {
+                if (raw_url.empty())
+                    bad = L"Docker/远程模式需填写服务地址（如 https://192.168.1.10:7863）";
+                else if (c.work.server_url.empty())
+                    bad = L"服务地址格式非法（需 http:// 或 https:// + 主机名）";
+            } else if (c.work.service_dir.empty()) {
+                bad = L"服务目录不能为空";
+            }
+            // 端口只属于本地模式：Docker 模式下输入框已隐藏，若仍校验，用户在
+            // 本地模式留下的非法端口会拦住保存且无法就地修正。
+            if (bad.empty() && c.work.deploy_mode != DM_DOCKER &&
+                (c.work.port <= 0 || c.work.port > 65535))
+                bad = L"端口非法";
+            if (bad.empty() && (c.work.poll_interval_sec < 10 || c.work.poll_interval_sec > 600))
+                bad = L"轮询间隔需 10–600 秒";
+            if (bad.empty() && (c.work.admin_poll_sec < 15 || c.work.admin_poll_sec > 600))
+                bad = L"管理轮询需 15–600 秒";
+            if (bad.empty() && (c.work.credits_refresh_interval_min < 0 || c.work.credits_refresh_interval_min > 1440))
                 bad = L"自动刷新积分需 0(关) 或 1–1440 分钟";
             if (!bad.empty()) {
                 MessageBoxW(hDlg, bad.c_str(), L"设置未保存", MB_OK | MB_ICONWARNING);
@@ -1178,36 +1317,44 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_BTN_STOP: Worker::Instance().RequestStopService(); return TRUE;
         case IDC_BTN_RESTART: Worker::Instance().RequestRestartService(); return TRUE;
         case IDC_BTN_CRED: Worker::Instance().RequestRefreshCredits(); return TRUE;
-        case IDC_BTN_BROWSE: {
+        case IDC_CHK_DOCKER:
+            // 只切编辑副本；是否落盘仍由「保存」决定（与其它设置项同语义）。
+            c.work.deploy_mode = SendMessageW(c.chk_docker, BM_GETCHECK, 0, 0) == BST_CHECKED
+                ? DM_DOCKER : DM_LOCAL;
+            ApplyDeployModeUi(c);
+            return TRUE;
+        case IDC_BTN_AUTHS:
+            BrowseForFolder(hDlg, L"选择宿主机映射的 auths 目录（可选，仅用于显示令牌到期）",
+                c.auths_edt);
+            return TRUE;
+        case IDC_BTN_BROWSE:
             // SHBrowseForFolderW 内部走 COM（shell folder 枚举）且要求调用线程是 STA。
             // 插件对话框线程从未初始化 COM：弹窗内部消息循环等一个永远不会到的跨套间
-            // 回应，整个设置窗（连同宿主 UI 线程）直接卡死。任何返回值都配对
-            // CoUninitialize；同线程已初始化过（S_FALSE/SEC 重点）也不多还一次。
-            HRESULT cohr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-            if (FAILED(cohr)) return TRUE; // COM 起不来：放弃弹窗也不能吊死 UI
-            BROWSEINFOW bi{};
-            bi.hwndOwner = hDlg;
-            bi.lpszTitle = L"选择 workbuddy2api 服务目录（含 wb2api.exe 的文件夹）";
-            bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-            LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
-            if (pidl) {
-                std::vector<wchar_t> path(MAX_PATH * 4, 0);
-                if (SHGetPathFromIDListW(pidl, path.data())) SetWindowTextW(c.dir_edt, path.data());
-                CoTaskMemFree(pidl);
-            }
-            CoUninitialize();
+            // 回应，整个设置窗（连同宿主 UI 线程）直接卡死。helper 里已配对
+            // CoInitializeEx/CoUninitialize 并在失败时给出提示。
+            BrowseForFolder(hDlg, L"选择 workbuddy2api 服务目录（含 wb2api.exe 的文件夹）",
+                c.dir_edt);
             return TRUE;
-        }
         case IDC_BTN_OPENCFG:
             if (!c.work.config_dir.empty())
                 ShellExecuteW(hDlg, L"open", c.work.config_dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             return TRUE;
         case IDC_BTN_OPENSVC: {
-            std::wstring d = GetText(c.dir_edt);
+            // 本地模式打开服务目录；Docker 模式没有服务目录，退而打开可选的 auths
+            // 映射目录（用户填了才有的本地路径）。
+            std::wstring d = c.work.deploy_mode == DM_DOCKER ? GetText(c.auths_edt) : GetText(c.dir_edt);
             if (!d.empty()) ShellExecuteW(hDlg, L"open", d.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            else MessageBoxW(hDlg, c.work.deploy_mode == DM_DOCKER
+                ? L"Docker/远程模式没有本地服务目录；可填写 auths 映射目录后再打开。"
+                : L"服务目录为空。", L"打开目录", MB_OK | MB_ICONINFORMATION);
             return TRUE;
         }
         case IDC_BTN_OPENLOG: {
+            if (c.work.deploy_mode == DM_DOCKER) {
+                MessageBoxW(hDlg, L"Docker/远程模式的服务日志在容器内：\n"
+                    L"docker compose logs -f wb2api", L"服务日志", MB_OK | MB_ICONINFORMATION);
+                return TRUE;
+            }
             std::wstring d = GetText(c.dir_edt);
             if (!d.empty()) ShellExecuteW(hDlg, L"open", (d + L"\\logs").c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             return TRUE;
@@ -1232,27 +1379,34 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
                     } else if (slot == 5) {
                         Worker::Instance().RequestRunTask(kKinds[base]);
                     } else if (slot == 7) {
-                        // 「应用」：把输入框的"9,21"解析成小时列表写回服务 config.json（重启生效）
-                        std::wstring raw = GetText(c.task[base].time);
+                        // 「应用」：把输入框的"9,21"解析成小时列表写回服务 config.json。
+                        // 空串或 "-" = 空小时表；只有活动补偿允许（= 只手动执行），
+                        // 其余任务空表仍按误用拦截（禁用请走勾选）。
+                        std::wstring raw = TrimW(GetText(c.task[base].time));
                         std::vector<int> hours;
                         bool bad = false;
-                        // 按逗号（中英文皆可）/空白切分；只收 0-23 的纯数字
-                        size_t pos = 0;
-                        while (pos < raw.size() && !bad) {
-                            size_t e = raw.find_first_of(L",， \t", pos);
-                            if (e == std::wstring::npos) e = raw.size();
-                            if (e > pos) {
-                                std::wstring seg = raw.substr(pos, e - pos);
-                                int hv = _wtoi(seg.c_str());
-                                if (hv < 0 || hv > 23 ||
-                                    seg.find_first_not_of(L"0123456789") != std::wstring::npos)
-                                    bad = true;
-                                else hours.push_back(hv);
+                        if (raw != L"-" && !raw.empty()) {
+                            // 按逗号（中英文皆可）/空白切分；只收 0-23 的纯数字
+                            size_t pos = 0;
+                            while (pos < raw.size() && !bad) {
+                                size_t e = raw.find_first_of(L",， \t", pos);
+                                if (e == std::wstring::npos) e = raw.size();
+                                if (e > pos) {
+                                    std::wstring seg = raw.substr(pos, e - pos);
+                                    int hv = _wtoi(seg.c_str());
+                                    if (hv < 0 || hv > 23 ||
+                                        seg.find_first_not_of(L"0123456789") != std::wstring::npos)
+                                        bad = true;
+                                    else hours.push_back(hv);
+                                }
+                                pos = e + 1;
                             }
-                            pos = e + 1;
                         }
-                        if (bad || hours.empty())
-                            MessageBoxW(hDlg, L"触发时间需为 0-23 的小时数字，用逗号分隔（如 9,21）",
+                        const bool manual_only = hours.empty();
+                        const bool allow_empty = kKinds[base] == std::string("compensation");
+                        if (bad || (manual_only && !allow_empty))
+                            MessageBoxW(hDlg, L"触发时间需为 0-23 的小时数字，用逗号分隔（如 9,21）；\n"
+                                L"仅活动补偿可留空或填 -（只手动执行）",
                                 L"格式不对", MB_OK | MB_ICONWARNING);
                         else
                             Worker::Instance().RequestSetTaskHours(kKinds[base], hours);

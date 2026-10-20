@@ -105,6 +105,11 @@ bool ServiceFilesOk(std::wstring& err)
 
 bool StartService(std::wstring& err, const std::atomic<bool>* cancel)
 {
+    Settings s0 = SettingsStore::Instance().Get();
+    if (s0.deploy_mode == DM_DOCKER) {
+        err = L"Docker/远程模式：插件不启动本地服务（请在容器宿主机操作）";
+        return false;
+    }
     if (!ServiceFilesOk(err)) return false;
     Settings s = SettingsStore::Instance().Get();
     Listener l = FindPortListener(s.port);
@@ -156,6 +161,10 @@ bool StartService(std::wstring& err, const std::atomic<bool>* cancel)
 bool StopService(std::wstring& err, const std::atomic<bool>* cancel)
 {
     Settings s = SettingsStore::Instance().Get();
+    if (s.deploy_mode == DM_DOCKER) {
+        err = L"Docker/远程模式：插件不操作容器服务（请在容器宿主机操作）";
+        return false;
+    }
     Listener l = FindPortListener(s.port);
     if (!l.found) return true; // 已经不在
     if (!l.is_our_service) {
@@ -164,8 +173,8 @@ bool StopService(std::wstring& err, const std::atomic<bool>* cancel)
         return false;
     }
     // 优先优雅停（admin 可用时：flush state.json 后干净退出）
-    std::string key = SettingsStore::Instance().CurrentApiKey();
-    std::wstring url = WideFormat(L"http://127.0.0.1:%d/admin/shutdown", s.port);
+    std::string key = SettingsStore::Instance().CurrentApiKey(s);
+    std::wstring url = ServiceBaseUrl(s) + L"/admin/shutdown";
     HttpResponse resp = HttpJson(L"POST", url, key, "{}", 1500);
     if (resp.status == 200) {
         LogI(L"stop: /admin/shutdown 已受理");
@@ -198,7 +207,7 @@ bool StopService(std::wstring& err, const std::atomic<bool>* cancel)
 bool WaitHealthzReady(int timeout_ms, const std::atomic<bool>* cancel)
 {
     Settings s = SettingsStore::Instance().Get();
-    std::wstring url = WideFormat(L"http://127.0.0.1:%d/healthz", s.port);
+    std::wstring url = ServiceBaseUrl(s) + L"/healthz";
     ULONGLONG t0 = GetTickCount64();
     while (GetTickCount64() - t0 < static_cast<ULONGLONG>(timeout_ms)) {
         if (cancel && cancel->load()) return false;

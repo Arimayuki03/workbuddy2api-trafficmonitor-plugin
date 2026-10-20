@@ -3,7 +3,11 @@
 #include "logger.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <cwctype>
 #include <fstream>
+#include <shlwapi.h>
+
+#pragma comment(lib, "shlwapi.lib")
 
 namespace wb2 {
 
@@ -45,6 +49,21 @@ Settings ParseSettings(const json& j)
     auto get_bool = [&j](const char* k, bool& dst) {
         if (j.contains(k) && j[k].is_boolean()) dst = j[k].get<bool>();
     };
+    auto get_utf8 = [&j](const char* k, std::string& dst) {
+        if (j.contains(k) && j[k].is_string()) dst = j[k].get<std::string>();
+    };
+    {
+        int dm = static_cast<int>(s.deploy_mode);
+        get_int("deploy_mode", dm);
+        if (dm == DM_DOCKER) s.deploy_mode = DM_DOCKER;
+        else if (dm != DM_LOCAL) {
+            LogW(WideFormat(L"settings: deploy_mode=%d 非法，回落本地模式", dm));
+            s.deploy_mode = DM_LOCAL;
+        }
+    }
+    get_str("server_url", s.server_url);
+    get_utf8("api_key", s.api_key);
+    get_str("auths_dir", s.auths_dir);
     get_str("service_dir", s.service_dir);
     get_int("port", s.port);
     get_int("poll_interval_sec", s.poll_interval_sec);
@@ -90,20 +109,21 @@ Settings ParseSettings(const json& j)
         s.credits_refresh_interval_min = 1; // 下限 1 分钟（服务端冷却兜底防风控）
     if (s.credits_refresh_interval_min > 1440) s.credits_refresh_interval_min = 1440;
     if (s.show_mode < 0 || s.show_mode > 2) s.show_mode = SM_STATE_ACCOUNT;
-    s.service_dir = TrimW(s.service_dir);
-    // 去掉可能带上的引号与结尾反斜杠
-    if (!s.service_dir.empty() && s.service_dir.front() == L'"') {
-        if (s.service_dir.back() == L'"') s.service_dir.pop_back();
-        s.service_dir.erase(0, 1);
-    }
-    while (!s.service_dir.empty() && (s.service_dir.back() == L'\\' || s.service_dir.back() == L'/'))
-        s.service_dir.pop_back();
+    // 目录/URL/密钥统一走共享归一函数（与设置对话框保存同一份实现）。
+    s.service_dir = NormalizeLocalDir(std::move(s.service_dir));
+    s.auths_dir = NormalizeLocalDir(std::move(s.auths_dir));
+    s.server_url = NormalizeServiceUrl(std::move(s.server_url));
+    s.api_key = SanitizeApiKey(s.api_key);
     return s;
 }
 
 json SerializeSettings(const Settings& s)
 {
     json j;
+    j["deploy_mode"] = static_cast<int>(s.deploy_mode);
+    j["server_url"] = WideToUtf8(s.server_url);
+    j["api_key"] = s.api_key;
+    j["auths_dir"] = WideToUtf8(s.auths_dir);
     j["service_dir"] = WideToUtf8(s.service_dir);
     j["port"] = s.port;
     j["poll_interval_sec"] = s.poll_interval_sec;
@@ -131,6 +151,84 @@ json SerializeSettings(const Settings& s)
 }
 
 } // namespace
+
+std::wstring NormalizeLocalDir(std::wstring v)
+{
+    v = TrimW(std::move(v));
+    // 只剥成对引号：资源管理器"复制为路径"会给整串加引号；半截引号保留原样，
+    // 让 PathFileExists 失败时用户能看到真实输入，而不是被悄悄改坏。
+    if (v.size() >= 2 && v.front() == L'"' && v.back() == L'"')
+        v = v.substr(1, v.size() - 2);
+    // 盘符根（D:\）保留尾分隔符：去掉会变成 "D:"，语义从"根目录"变成
+    // "D 盘当前目录"，PathFileExists/子目录拼接全都会错。
+    const bool drive_root = v.size() == 3 && v[1] == L':' &&
+        (v[2] == L'\\' || v[2] == L'/');
+    if (!drive_root)
+        while (!v.empty() && (v.back() == L'\\' || v.back() == L'/'))
+            v.pop_back();
+    return TrimW(std::move(v));
+}
+
+std::wstring NormalizeServiceUrl(std::wstring v)
+{
+    v = TrimW(std::move(v));
+    if (v.size() >= 2 && v.front() == L'"' && v.back() == L'"')
+        v = v.substr(1, v.size() - 2);
+    v = TrimW(std::move(v));
+    // 粘贴常见的前导斜杠（//host:port）先剥掉，再补 scheme。
+    while (!v.empty() && (v.front() == L'/' || v.front() == L'\\'))
+        v.erase(0, 1);
+    if (v.empty()) return L"";
+    // 裸空白/控制字符直接判非法：它们会破坏 URL 或请求头，且合法 URL 本就不该含。
+    for (wchar_t ch : v)
+        if (ch <= 0x20 || ch == 0x7f) return L"";
+    if (v.find(L"://") == std::wstring::npos) v = L"http://" + v;
+
+    std::wstring low = v;
+    std::transform(low.begin(), low.end(), low.begin(),
+        [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); });
+    size_t host_start = 0;
+    if (low.rfind(L"http://", 0) == 0) host_start = 7;
+    else if (low.rfind(L"https://", 0) == 0) host_start = 8;
+    else return L""; // 只支持 http/https（WinHTTP 也只处理这两种）
+    while (v.size() > host_start && (v.back() == L'/' || v.back() == L'\\'))
+        v.pop_back();
+    if (v.size() <= host_start) return L""; // 只有 "http://" 没有主机
+    return v;
+}
+
+std::string SanitizeApiKey(const std::string& key)
+{
+    // 该值会原样拼进 Authorization: Bearer <key> 头（http.cpp）。内部 CR/LF 会
+    // 拆出额外头（头注入），NUL/其他控制字符会让请求畸形——统一剔除。
+    std::wstring w = Utf8ToWide(key);
+    w.erase(std::remove_if(w.begin(), w.end(),
+        [](wchar_t ch) { return ch < 0x20 || ch == 0x7f; }), w.end());
+    return WideToUtf8(TrimW(std::move(w)));
+}
+
+std::wstring ServiceBaseUrl(const Settings& s)
+{
+    // Docker/远程模式绝不回落到本机：未填地址时返回空串，由调用点提示并短路。
+    if (s.deploy_mode == DM_DOCKER) return s.server_url;
+    return WideFormat(L"http://127.0.0.1:%d", s.port);
+}
+
+std::wstring AuthsDirectory(const Settings& s)
+{
+    if (s.deploy_mode == DM_DOCKER) {
+        std::wstring dir = s.auths_dir;
+        // 相对路径按插件配置目录解析（而不是 TrafficMonitor 的 CWD）：否则同一个
+        // 配置启动方式不同就会扫到不同目录，且失败后毫无线索。
+        if (!dir.empty() && PathIsRelativeW(dir.c_str())) {
+            if (s.config_dir.empty()) return L"";
+            dir = s.config_dir + L"\\" + dir;
+        }
+        return dir;
+    }
+    if (s.service_dir.empty()) return L"";
+    return s.service_dir + L"\\auths";
+}
 
 SettingsStore& SettingsStore::Instance()
 {
@@ -215,11 +313,8 @@ Settings SettingsStore::Modify(const std::function<void(Settings&)>& fn)
     return copy;
 }
 
-std::string SettingsStore::CurrentApiKey()
+std::string SettingsStore::ReadApiKeyLocked(const std::wstring& file)
 {
-    std::lock_guard<std::mutex> lk(mu_);
-    if (cur_.service_dir.empty()) return {};
-    std::wstring file = cur_.service_dir + L"\\config.json";
     HANDLE h = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return {};
@@ -234,6 +329,7 @@ std::string SettingsStore::CurrentApiKey()
     if (mt_ok && mt.dwLowDateTime == key_mtime_.dwLowDateTime &&
         mt.dwHighDateTime == key_mtime_.dwHighDateTime && file == key_file_)
         return key_cached_; // mtime 未变：吃缓存
+
     std::string key;
     try {
         json j = json::parse(content);
@@ -242,10 +338,32 @@ std::string SettingsStore::CurrentApiKey()
     } catch (...) {
         key.clear();
     }
+    key = SanitizeApiKey(key);
     key_file_ = file;
     key_mtime_ = mt;
     key_cached_ = key;
     return key;
+}
+
+std::string SettingsStore::CurrentApiKey()
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    // Docker/远程模式：容器内 config.json 不在本机，只能用手动填写的 key。
+    // 留空时返回空串——/healthz 与 /status 若服务端未配 key 仍可用；配了 key
+    // 则会得到 401，由各调用点给出"检查 API Key"提示。
+    if (cur_.deploy_mode == DM_DOCKER) return SanitizeApiKey(cur_.api_key);
+    if (cur_.service_dir.empty()) return {};
+    return ReadApiKeyLocked(cur_.service_dir + L"\\config.json");
+}
+
+std::string SettingsStore::CurrentApiKey(const Settings& s)
+{
+    // 调用方已在同一份快照上算过 base URL：这里必须用同一份 s，不能再读全局
+    // cur_，否则模式切换窗口会出现 base 与 key 来自不同部署方式。
+    std::lock_guard<std::mutex> lk(mu_);
+    if (s.deploy_mode == DM_DOCKER) return SanitizeApiKey(s.api_key);
+    if (s.service_dir.empty()) return {};
+    return ReadApiKeyLocked(s.service_dir + L"\\config.json");
 }
 
 } // namespace wb2

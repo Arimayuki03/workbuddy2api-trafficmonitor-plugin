@@ -97,6 +97,15 @@ std::wstring FormatTimeShort(int64_t unix_sec)
     return buf;
 }
 
+bool IsSessionRevokedReason(const std::wstring& reason)
+{
+    // 服务端常量原文："upstream 401 gateway page (session revoked), re-login required"。
+    // 同时认 "401 gateway page" 与 "session revoked" 两个片段：前者是现象、后者是
+    // 语义，服务端未来改文案时命中任一即可，不必同步改插件。
+    return reason.find(L"401 gateway page") != std::wstring::npos ||
+        reason.find(L"session revoked") != std::wstring::npos;
+}
+
 std::wstring FormatRfc3339Short(const std::string& rfc)
 {
     // "2026-09-16T09:00:00+08:00" → 提取 HH:mm（本时区一致性由上游保证：wb2api 用

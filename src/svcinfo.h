@@ -154,6 +154,11 @@ struct Snapshot {
 
     // /healthz
     int total = 0, healthy = 0;
+    // 域可服务性（wb2api ≥ v1.16.0 /healthz realm_servable）：双域部署时分别看
+    // cn/global 是否还有号可服务。键缺失（旧版服务端）= realm_known=false，不展示。
+    // 与 healthy/total 的分工：后者是池子整体口径，这里是"哪个域还能接活"。
+    bool realm_known = false;
+    bool cn_servable = false, global_servable = false;
 
     // /status
     std::vector<AccountInfo> accounts;
@@ -165,9 +170,19 @@ struct Snapshot {
     std::vector<ModelLockInfo> model_locks;
     // 积分保底线（wb2api ≥ v1.16.0 /status 顶层 credit_floor；0=关或旧版服务端）。
     int64_t credit_floor = 0;
+    // 成本探索台账（wb2api v1.19.x /status 顶层 cost_explore）：events_total=累计探索
+    // 事件数；per_model 是 "realm|model" → 最近探索时刻。解析时压成"最近一次"一行，
+    // 用于解释"为什么这个号最近被选中/这个模型最近在换号"。
+    int64_t explore_events = 0;
+    std::wstring explore_last_model;
+    int64_t explore_last_ts = 0;
 
     // /admin/*
     bool admin_available = false;   // /admin/tasks 返回过 200
+    // /admin 返回 403：服务端 loopback 闸拒绝（Docker/远程直连的典型表现）。
+    // 与 404（admin 未启用/版本旧）分开，UI 才能给出"用 SSH 隧道"而不是"去开
+    // admin.enabled"的错误建议。
+    bool admin_forbidden = false;
     std::vector<TaskInfo> tasks;
     int64_t tasks_ts = 0;
     CreditsInfo credits;

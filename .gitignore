@@ -14,6 +14,7 @@ build/obj/
 # 工具/会话缓存
 .v2c/
 .zcode/
+.mimosa/
 # 运行期临时
 wb2_*.log
 shot_cfg/

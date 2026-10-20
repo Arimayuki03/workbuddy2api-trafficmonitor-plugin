@@ -61,6 +61,10 @@ public:
     bool StopRequested() const { return stop_.load(); }
 
     void RefreshSoon();              // 请求下一循环立即跑（动作完成后调用）
+    // 只写一条一次性操作提示（tooltip/设置页脚回显），不派生线程、不做 I/O。
+    // 用于 Docker/远程模式下被禁用的本地动作（启停/自启）给出明确原因——静默
+    // 无响应比按钮置灰更让人困惑。
+    void Note(const std::wstring& text);
 
 private:
     Worker() = default;
@@ -99,6 +103,8 @@ private:
     ULONGLONG next_base_ = 0, next_admin_ = 0, next_auths_ = 0;
     ULONGLONG next_auto_credit_ = 0; // 实时积分自动刷新的下次尝试时间
     bool start_tm_done_ = false;     // start_with_tm 只试一次（worker 线程私有）
+    int last_deploy_mode_ = -1;      // 上次轮询看到的部署方式（切换时清快照）
+    std::wstring last_base_url_;     // 上次轮询使用的 base URL（地址变化同样清快照）
     int consecutive_soft_fail_ = 0;  // 超时类连续失败计数（防抖）
     std::deque<ULONGLONG> relaunch_ts_; // 异常拉起退避窗口
 };

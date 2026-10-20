@@ -5,6 +5,7 @@
 //  * 身份校验双保险：X-Service 头 或 body.service —— 二者都不是 workbuddy2api → WrongService；
 //  * 判"停止"前顺手查端口归属：被外来进程占用要显示"被占用"而不是"已停止"。
 #include "worker.h"
+#include "autostart.h"
 #include "common.h"
 #include "http.h"
 #include "logger.h"
@@ -167,6 +168,16 @@ int64_t RfcToUnix(const std::string& s)
 
 int64_t NowSec() { return static_cast<int64_t>(time(nullptr)); }
 
+// 动作入口的统一短路：Docker/远程模式未填服务地址时，绝不让
+// ServiceBaseUrl 的空串被拼成 "/admin/..." 再交给 WinHTTP（虽然也不会打到
+// 本机，但错误信息会变成难懂的"URL 解析失败"）。给出可读原因后直接收工。
+bool BaseUrlMissing(const Settings& s, std::wstring& note)
+{
+    if (!ServiceBaseUrl(s).empty()) return false;
+    note = L"未配置 Docker/远程服务地址（设置页①填写）";
+    return true;
+}
+
 // 服务端 hours 数组与在途提交文本（"9,21" 形态，RequestSetTaskHours 生成）比对：
 // 相等即"快照已追上提交目标值"。轮询线程据此就地了结 pending 标记，不等设置窗
 // 打开来判定——对话框一直关着时，残留标记会遮住 web 端后续的小时表修改。
@@ -177,6 +188,9 @@ bool HoursMatchText(const std::vector<int>& hours, const std::wstring& txt)
         if (!s.empty()) s += L",";
         s += std::to_wstring(hv);
     }
+    // 空小时表的在途提交文本是 "-"（"" 是"无在途提交"哨兵）：活动补偿的
+    // "留空/仅手动"提交要能被快照追上并了结，避免标记永久挂着遮住 web 端修改。
+    if (s.empty()) s = L"-";
     return !txt.empty() && s == txt;
 }
 
@@ -208,14 +222,14 @@ std::wstring NextFireText(const std::vector<int>& hours)
 
 std::wstring KindLabel(const std::string& kind)
 {
-    // 与 wb2api kindNames 对齐（checkin/travel/activity/keepalive/cat/queue/renew；
-    // school 开学季活动已随 wb2api v1.15.0 下架，但服务端枚举位保留——/admin/tasks
-    // 快照仍可能返回该行，保留映射让 tooltip 任务区过滤后仍能正确标注。
-    // renew=令牌续期自 wb2api v1.16.0 加入）。
+    // 与 wb2api kindNames 对齐（checkin/travel/activity/keepalive/cat/queue/renew/
+    // compensation；school 开学季活动已随 wb2api v1.15.0 下架，但服务端枚举位保留
+    // ——/admin/tasks 快照仍可能返回该行，保留映射让 tooltip 任务区过滤后仍能正确
+    // 标注。renew=令牌续期自 v1.16.0；compensation=活动补偿自 v1.19.2）。
     static const std::map<std::string, std::wstring> m = {
         { "checkin", L"签到" }, { "travel", L"猫猫旅行" }, { "activity", L"活跃上报" },
         { "keepalive", L"Token 保活" }, { "school", L"开学季" }, { "cat", L"夜猫子" },
-        { "queue", L"任务队列" }, { "renew", L"令牌续期" },
+        { "queue", L"任务队列" }, { "renew", L"令牌续期" }, { "compensation", L"活动补偿" },
     };
     auto it = m.find(kind);
     return it == m.end() ? Utf8ToWide(kind) : it->second;
@@ -368,6 +382,11 @@ void Worker::NoteLocked(Snapshot& s, const std::wstring& note)
     s.action_note_ts = (int64_t)time(nullptr);
 }
 
+void Worker::Note(const std::wstring& text)
+{
+    Update([&](Snapshot& sn) { NoteLocked(sn, text); });
+}
+
 // ============================================================================
 // 轮询主循环
 // ============================================================================
@@ -407,6 +426,29 @@ void Worker::MaybeStartWithTm()
     if (start_tm_done_) return;
     start_tm_done_ = true;
     Settings s = SettingsStore::Instance().Get();
+    if (s.deploy_mode == DM_DOCKER) {
+        // Docker/远程：本地无进程可拉起。同时清掉可能从旧版本/本地模式遗留的
+        // 计划任务与两个拉起标志——否则下次登录仍会启动一个本机 wb2api，
+        // 与"Docker 模式不启动本地服务"直接矛盾。只在确实残留时才动系统。
+        if (s.autostart_task || s.start_with_tm || s.auto_relaunch) {
+            bool removed = true;
+            if (s.autostart_task) {
+                std::wstring err;
+                removed = autostart::Uninstall(err, &stop_);
+                if (stop_.load()) return; // 宿主卸载中：不写配置，下次启动再试
+                if (!removed) LogW(L"docker mode: 卸载遗留计划任务失败（下次启动重试）: " + err);
+                else LogI(L"docker mode: 已卸载遗留的开机自启计划任务");
+            }
+            SettingsStore::Instance().Modify([removed](Settings& st) {
+                // 卸载失败则保留 autostart_task=true，让下次启动再尝试清掉；
+                // 两个运行期拉起标志无论成败都清零（它们本身不注册系统任务）。
+                if (removed) st.autostart_task = false;
+                st.start_with_tm = false;
+                st.auto_relaunch = false;
+            });
+        }
+        return;
+    }
     if (!s.start_with_tm || s.service_dir.empty()) return;
     if (State() != SvcState::Stopped) return; // 已在跑/被占用：不干预
     LogI(L"start_with_tm: 拉起服务");
@@ -416,8 +458,42 @@ void Worker::MaybeStartWithTm()
 void Worker::PollOnce()
 {
     Settings s = SettingsStore::Instance().Get();
-    std::wstring base = WideFormat(L"http://127.0.0.1:%d", s.port);
-    HttpResponse hr = HttpJson(L"GET", base + L"/healthz", "", "", 2500);
+    const bool docker = s.deploy_mode == DM_DOCKER;
+    std::wstring base = ServiceBaseUrl(s);
+
+    // 部署方式或服务地址变化：旧服务端的任务/用量/admin 结论全部作废，尤其
+    // stats_ts 的 404 冷却会让新服务端半小时内不再拉取模型用量。清空快照并
+    // 立即重排 admin/auths 轮询；首次轮询（-1）不清。next_* 为轮询线程私有字段。
+    const bool endpoint_changed = last_deploy_mode_ != -1 &&
+        (last_deploy_mode_ != s.deploy_mode || last_base_url_ != base);
+    if (last_deploy_mode_ == -1) {
+        last_deploy_mode_ = s.deploy_mode;
+        last_base_url_ = base;
+    } else if (endpoint_changed) {
+        last_deploy_mode_ = s.deploy_mode;
+        last_base_url_ = base;
+        next_auths_ = 0;
+        next_admin_ = 0;
+        consecutive_soft_fail_ = 0; // 旧服务端的连续超时不能把新服务端直接判 Dead
+        relaunch_ts_.clear();       // 旧服务端的拉起历史不带到新服务端
+        Update([](Snapshot& sn) { sn = Snapshot{}; });
+        LogI(L"poll: 部署方式/服务地址变化，已清空旧服务端快照");
+    }
+
+    // Docker 模式未填地址：绝不回落到本机（见 ServiceBaseUrl 注释）。不探测、
+    // 不请求，直接以"停止"态给出可读原因。
+    if (base.empty()) {
+        Update([](Snapshot& sn) {
+            sn.state = SvcState::Stopped;
+            sn.pid = 0;
+            sn.last_error = L"未配置 Docker/远程服务地址（设置页①填写）";
+        });
+        return;
+    }
+
+    // 远程链路（Docker 宿主/NAS/局域网）往返比 loopback 慢一档：超时放宽到 6s，
+    // 否则慢一点的应答会被当成抖动，状态灯反复闪。本地保持原 2.5s 的快节奏。
+    HttpResponse hr = HttpJson(L"GET", base + L"/healthz", "", "", docker ? 6000 : 2500);
 
     Snapshot patch;
     bool id_ok = false;
@@ -428,6 +504,20 @@ void Worker::PollOnce()
         if (id_ok) {
             patch.total = (int)JInt(body, "total");
             patch.healthy = (int)JInt(body, "healthy");
+            // 域可服务性（wb2api ≥ v1.16.0 /healthz realm_servable）：双域部署时
+            // 单独看 cn/global 是否还有号可服务；键缺失=旧版服务端，保持 unknown。
+            if (body.contains("realm_servable") && body["realm_servable"].is_object()) {
+                const json& rs = body["realm_servable"];
+                // 两个键都必须是布尔值才可信：单域部署/字段裁剪只给一侧时，
+                // 缺失侧不能被 JBool 默认成 false（会误报该域不可用）。
+                const bool has_cn = rs.contains("cn") && rs["cn"].is_boolean();
+                const bool has_global = rs.contains("global") && rs["global"].is_boolean();
+                if (has_cn && has_global) {
+                    patch.realm_known = true;
+                    patch.cn_servable = rs["cn"].get<bool>();
+                    patch.global_servable = rs["global"].get<bool>();
+                }
+            }
             // 非 200 细分：503=wb2api"活着但无可用账号"（Unservable，绝不判停止）；
             // 其余非 200（404/500/401…）是真实故障，不能一律判成 Unservable 把橙点
             // 显示成"暂无可用账号"——走与超时同款防抖：保持旧态 + 错误行标状态码，
@@ -451,20 +541,27 @@ void Worker::PollOnce()
     } else {
         // 传输层失败 → 归类
         if (hr.transport == TransportError::Unreachable) {
-            proc::Listener l = proc::FindPortListener(s.port);
-            if (!l.found) {
+            if (docker) {
+                // 远程模式没有"本机端口归属"可查：连不上就是连不上（灰点），不查
+                // 进程表——否则会把本机恰好占用同端口的无关程序误判成 WrongService。
                 patch.state = SvcState::Stopped;
                 consecutive_soft_fail_ = 0;
-            } else if (!l.is_our_service) {
-                patch.state = SvcState::WrongService;
-                patch.pid = l.pid;
-                patch.last_error = WideFormat(L"端口 %d 被其他程序占用：PID %lu %s",
-                    s.port, l.pid, l.exe_path.c_str());
             } else {
-                // 自家进程占着端口却拒绝 HTTP —— 半死状态
-                patch.state = SvcState::Dead;
-                patch.pid = l.pid;
-                consecutive_soft_fail_++;
+                proc::Listener l = proc::FindPortListener(s.port);
+                if (!l.found) {
+                    patch.state = SvcState::Stopped;
+                    consecutive_soft_fail_ = 0;
+                } else if (!l.is_our_service) {
+                    patch.state = SvcState::WrongService;
+                    patch.pid = l.pid;
+                    patch.last_error = WideFormat(L"端口 %d 被其他程序占用：PID %lu %s",
+                        s.port, l.pid, l.exe_path.c_str());
+                } else {
+                    // 自家进程占着端口却拒绝 HTTP —— 半死状态
+                    patch.state = SvcState::Dead;
+                    patch.pid = l.pid;
+                    consecutive_soft_fail_++;
+                }
             }
         } else {
             // 超时/其他：防抖。连续 5 次才降级。
@@ -475,12 +572,16 @@ void Worker::PollOnce()
         if (hr.err.size()) patch.last_error = hr.err;
     }
 
-    std::string key = SettingsStore::Instance().CurrentApiKey();
+    // 用同一份 Settings 快照取 key：轮询期间用户切换部署模式时，base 与 key
+    // 不会来自不同模式（Docker key 发本机 / 本机 key 发远程）。
+    std::string key = SettingsStore::Instance().CurrentApiKey(s);
     if (id_ok) {
-        HttpResponse sr = HttpJson(L"GET", base + L"/status", key, "", 4000);
+        HttpResponse sr = HttpJson(L"GET", base + L"/status", key, "", docker ? 8000 : 4000);
         if (sr.status == 401) {
             if (patch.last_error.empty())
-                patch.last_error = L"/status 401：api_key 未配置或不符（在设置页填写，或放好服务目录 config.json）";
+                patch.last_error = docker
+                ? L"/status 401：API Key 不符（设置页填写服务端 config.json 的 api_key）"
+                : L"/status 401：api_key 未配置或不符（在设置页填写，或放好服务目录 config.json）";
         } else if (sr.status == 200) {
             json sj;
             try { sj = json::parse(sr.body); } catch (...) {}
@@ -508,6 +609,24 @@ void Worker::PollOnce()
                     }
                 }
                 patch.credit_floor = JInt(sj, "credit_floor");
+                // 成本探索台账（wb2api v1.19.x /status 顶层 cost_explore）：
+                // events_total=累计探索次数；per_model 是 "realm|model" → 最近探索
+                // 时刻（RFC3339）。这里只压成"最近一次"（模型 + 时间）供 tooltip
+                // 一行展示——逐模型明细没有额外的决策价值，只会挤爆预算。
+                if (sj.contains("cost_explore") && sj["cost_explore"].is_object()) {
+                    const json& ce = sj["cost_explore"];
+                    patch.explore_events = JInt(ce, "events_total");
+                    if (ce.contains("per_model") && ce["per_model"].is_object()) {
+                        for (auto it = ce["per_model"].begin(); it != ce["per_model"].end(); ++it) {
+                            if (!it.value().is_string()) continue;
+                            int64_t ts = RfcToUnix(it.value().get<std::string>());
+                            if (ts > patch.explore_last_ts) {
+                                patch.explore_last_ts = ts;
+                                patch.explore_last_model = Utf8ToWide(it.key());
+                            }
+                        }
+                    }
+                }
                 if (sj.contains("accounts") && sj["accounts"].is_array()) {
                     for (auto& a : sj["accounts"]) {
                         if (!a.is_object()) continue;
@@ -595,10 +714,16 @@ void Worker::PollOnce()
         sn.pid = patch.pid;
         if (id_ok) {
             sn.total = patch.total; sn.healthy = patch.healthy;
+            sn.realm_known = patch.realm_known;
+            sn.cn_servable = patch.cn_servable;
+            sn.global_servable = patch.global_servable;
             sn.cooling = patch.cooling; sn.disabled_n = patch.disabled_n; sn.sticky = patch.sticky;
             sn.in_flight_full = patch.in_flight_full;
             sn.model_locks = std::move(patch.model_locks);
             sn.credit_floor = patch.credit_floor;
+            sn.explore_events = patch.explore_events;
+            sn.explore_last_model = patch.explore_last_model;
+            sn.explore_last_ts = patch.explore_last_ts;
             if (patch.accounts_valid) {
                 sn.accounts = std::move(patch.accounts); sn.accounts_valid = true;
                 for (auto& a : sn.accounts) {
@@ -611,9 +736,12 @@ void Worker::PollOnce()
     });
 
     // —— 异常自动拉起 ——
+    // 注意：这里**不能提前 return**——后面还有实时积分自动刷新。Docker 模式只
+    // 跳过拉起分支（本机没有进程可拉），后续刷新逻辑照常执行。
     Snapshot sn = Copy();
     s = SettingsStore::Instance().Get();
-    if (sn.state == SvcState::Stopped && s.auto_relaunch && !s.user_stopped) {
+    if (s.deploy_mode != DM_DOCKER && sn.state == SvcState::Stopped &&
+        s.auto_relaunch && !s.user_stopped) {
         ULONGLONG now = GetTickCount64();
         while (!relaunch_ts_.empty() && now - relaunch_ts_.front() > 600000ULL) relaunch_ts_.pop_front();
         if (relaunch_ts_.size() < 3) {
@@ -645,12 +773,77 @@ void Worker::PollAdmin()
 {
     Settings s = SettingsStore::Instance().Get();
     if (!StateIsOn(Copy().state)) return; // 服务不在就别白发请求
-    std::string key = SettingsStore::Instance().CurrentApiKey();
-    std::wstring base = WideFormat(L"http://127.0.0.1:%d", s.port);
+    std::wstring base = ServiceBaseUrl(s);
+    if (base.empty()) return; // Docker/远程未配置地址：不探测本机
+    std::string key = SettingsStore::Instance().CurrentApiKey(s);
+    const bool docker = s.deploy_mode == DM_DOCKER;
 
-    HttpResponse tr = HttpJson(L"GET", base + L"/admin/tasks", key, "", 3000);
+    // /v1/stats 按模型用量（GET，与 /status 同源 api_key 鉴权）：credit=该模型累计
+    // 消耗积分，服务端进程内存聚合（重启清零）。**放在 /admin 请求之前**：
+    //   - Docker/远程直连时 /admin 会被 loopback 闸 403，旧顺序（stats 在 admin
+    //     成功之后）会让模型用量一起消失——而 /v1/stats 本身远程可用；
+    //   - admin 未启用（404）时同理，模型用量不该陪葬。
+    // 404=旧版服务端无此接口：记下探测时刻并静默 30 分钟再重探——旧版周期性白发
+    // 请求是浪费，但保留低频重探才能在服务端热升级后自动恢复（重启探活由 state
+    // 变化兜底，不依赖本间隔）。
+    {
+        bool skip = false;
+        Update([&](Snapshot& sn) {
+            if (!sn.stats_available && sn.stats_ts > 0)
+                skip = NowSec() - sn.stats_ts < 1800;
+        });
+        if (skip) {
+            WB2API_TRACE_LOG("PollAdmin: skip /v1/stats (404 cooldown)");
+        } else {
+            HttpResponse vr = HttpJson(L"GET", base + L"/v1/stats", key, "", docker ? 6000 : 3000);
+            if (vr.status == 200) {
+                json vj;
+                try { vj = json::parse(vr.body); } catch (...) {}
+                if (vj.is_object() && vj.contains("models") && vj["models"].is_array()) {
+                    std::vector<ModelUsage> usage;
+                    for (auto& m : vj["models"]) {
+                        if (!m.is_object()) continue;
+                        ModelUsage mu;
+                        mu.model = Utf8ToWide(JStr(m, "model"));
+                        if (mu.model.empty()) continue;
+                        mu.requests = JInt(m, "requests");
+                        mu.credit = JNum(m, "credit");
+                        mu.credit_per_req = JNum(m, "credit_per_req");
+                        mu.total_tokens = JInt(m, "total_tokens");
+                        // 上游积分倍率原文（上游 5009a1f，"x0.06" 形态；目录冷缓存/
+                        // 未下发时 omitempty 整体省略）。缺失≠免费：空串原样保留，
+                        // 显示侧整体省略。
+                        mu.ratio = Utf8ToWide(JStr(m, "credits"));
+                        usage.push_back(std::move(mu));
+                    }
+                    Update([&](Snapshot& sn) {
+                        sn.stats_available = true;
+                        sn.stats_ts = (int64_t)time(nullptr);
+                        sn.usage = std::move(usage);
+                    });
+                }
+            } else if (vr.status == 404) {
+                // stats_ts 记最后探测时刻（非成功时刻）：既是 30 分钟重探间隔的
+                // 锚点，也让 tooltip 的"需升级服务端"提示有条件成立。
+                Update([](Snapshot& sn) {
+                    sn.stats_available = false;
+                    sn.usage.clear();
+                    sn.stats_ts = (int64_t)time(nullptr);
+                });
+            }
+        }
+    }
+
+    HttpResponse tr = HttpJson(L"GET", base + L"/admin/tasks", key, "", docker ? 6000 : 3000);
     if (tr.status == 404) {
-        Update([](Snapshot& sn) { sn.admin_available = false; });
+        // 路由未注册：admin 未启用或服务端版本过旧。
+        Update([](Snapshot& sn) { sn.admin_available = false; sn.admin_forbidden = false; });
+        return;
+    }
+    if (tr.status == 403) {
+        // loopback 闸拒绝：Docker/远程直连的典型结果（服务端只接受 127.0.0.1 来源）。
+        // 与 404 分开记录，设置页/悬浮提示才能给出正确的排障方向。
+        Update([](Snapshot& sn) { sn.admin_available = false; sn.admin_forbidden = true; });
         return;
     }
     if (tr.status != 200) return; // 401/超时：维持上次结论
@@ -676,6 +869,7 @@ void Worker::PollAdmin()
     }
     Update([&](Snapshot& sn) {
         sn.admin_available = true;
+        sn.admin_forbidden = false;
         // 在途小时提交跨轮询结转：旧快照里还没了结的 pending_hours 搬进新快照。
         // 对话框在显示时判"快照 hours 已等于 pending"即了结它——快照用旧值回填
         // 窗口关闭；新任务行（服务端新增种类）无在途提交，自然为空。
@@ -712,51 +906,6 @@ void Worker::PollAdmin()
     CreditsInfo ci;
     ParseCreditsJson(cj, ci);
     Update([&](Snapshot& sn) { sn.credits = std::move(ci); });
-
-    // /v1/stats 按模型用量（GET，与 /status 同源 api_key 鉴权）：credit=该模型累计
-    // 消耗积分，服务端进程内存聚合（重启清零）。404=旧版服务端无此接口：记下探测
-    // 时刻并静默 30 分钟再重探——旧版周期性白发请求是浪费，但保留低频重探才能在
-    // 服务端热升级后自动恢复（重启探活由 state 变化兜底，不依赖本间隔）。
-    {
-        bool skip = false;
-        Update([&](Snapshot& sn) {
-            if (!sn.stats_available && sn.stats_ts > 0)
-                skip = NowSec() - sn.stats_ts < 1800;
-        });
-        if (skip) { WB2API_TRACE_LOG("PollAdmin: skip /v1/stats (404 cooldown)"); return; }
-    }
-    HttpResponse vr = HttpJson(L"GET", base + L"/v1/stats", key, "", 3000);
-    if (vr.status == 200) {
-        json vj;
-        try { vj = json::parse(vr.body); } catch (...) { return; }
-        if (!vj.is_object() || !vj.contains("models") || !vj["models"].is_array()) return;
-        std::vector<ModelUsage> usage;
-        for (auto& m : vj["models"]) {
-            if (!m.is_object()) continue;
-            ModelUsage mu;
-            mu.model = Utf8ToWide(JStr(m, "model"));
-            if (mu.model.empty()) continue;
-            mu.requests = JInt(m, "requests");
-            mu.credit = JNum(m, "credit");
-            mu.credit_per_req = JNum(m, "credit_per_req");
-            mu.total_tokens = JInt(m, "total_tokens");
-            // 上游积分倍率原文（上游 5009a1f，"x0.06" 形态；目录冷缓存/未下发时
-            // omitempty 整体省略）。缺失≠免费：空串原样保留，显示侧整体省略。
-            mu.ratio = Utf8ToWide(JStr(m, "credits"));
-            usage.push_back(std::move(mu));
-        }
-        Update([&](Snapshot& sn) {
-            sn.stats_available = true;
-            sn.stats_ts = (int64_t)time(nullptr);
-            sn.usage = std::move(usage);
-        });
-    } else if (vr.status == 404) {
-        // stats_ts 记最后探测时刻（非成功时刻）：既是 30 分钟重探间隔的锚点，
-        // 也让 tooltip 的"需升级服务端"提示有条件成立（老版本从不置 stats_ts 的话
-        // 提示永不显示——OCR 审查确认的口径分裂）。
-        Update([](Snapshot& sn) { sn.stats_available = false; sn.usage.clear();
-                                  sn.stats_ts = (int64_t)time(nullptr); });
-    }
 }
 
 // ============================================================================
@@ -766,15 +915,33 @@ void Worker::PollAdmin()
 void Worker::ScanAuthExpiry()
 {
     Settings s = SettingsStore::Instance().Get();
-    if (s.service_dir.empty()) return;
-    std::wstring pattern = s.service_dir + L"\\auths\\workbuddy*.json";
+    // 本地模式=service_dir\auths；Docker 模式=设置里可选的宿主机映射目录。
+    // 留空（远程机器没有本地 auths 映射）→ 不扫描，令牌列显示 "-"。
+    std::wstring auth_dir = AuthsDirectory(s);
+    if (auth_dir.empty()) {
+        // Docker 模式未填映射目录（或从本地切过来）：必须清掉上一模式的缓存，
+        // 否则账户表会一直显示旧 token 剩余天数，看起来像远程也读到了凭证。
+        Update([this](Snapshot& sn) {
+            token_expiry_.clear();
+            for (auto& a : sn.accounts) a.token_expiry = 0;
+        });
+        return;
+    }
+    std::wstring pattern = auth_dir + L"\\workbuddy*.json";
     WIN32_FIND_DATAW find{};
     HANDLE hf = FindFirstFileW(pattern.c_str(), &find);
-    if (hf == INVALID_HANDLE_VALUE) return;
+    if (hf == INVALID_HANDLE_VALUE) {
+        // 目录不存在/无权限同样要清缓存：否则切模式或换目录后会一直显示旧值。
+        Update([this](Snapshot& sn) {
+            token_expiry_.clear();
+            for (auto& a : sn.accounts) a.token_expiry = 0;
+        });
+        return;
+    }
     std::map<std::string, int64_t> out;
     do {
         if (find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        std::wstring full = s.service_dir + L"\\auths\\" + find.cFileName;
+        std::wstring full = auth_dir + L"\\" + find.cFileName;
         std::string raw;
         HANDLE h = CreateFileW(full.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -884,14 +1051,27 @@ void Worker::BuildDisplayLocked()
     case SvcState::Running: state_txt = L"运行中"; break;
     case SvcState::Unservable: state_txt = L"运行中（暂无可用账号）"; break;
     case SvcState::Starting: state_txt = L"启动中…"; break;
-    case SvcState::Stopped: state_txt = L"已停止"; break;
-    case SvcState::WrongService: state_txt = L"端口被其他程序占用"; break;
-    case SvcState::Dead: state_txt = L"进程无响应"; break;
+    case SvcState::Stopped:
+        state_txt = st.deploy_mode == DM_DOCKER ? L"无法连接（Docker/远程）" : L"已停止";
+        break;
+    case SvcState::WrongService:
+        state_txt = st.deploy_mode == DM_DOCKER
+            ? L"服务地址返回的不是 workbuddy2api"
+            : L"端口被其他程序占用";
+        break;
+    case SvcState::Dead:
+        state_txt = st.deploy_mode == DM_DOCKER
+            ? L"服务无响应（Docker/远程）"
+            : L"进程无响应";
+        break;
     }
     std::wstring head = WideFormat(L"WorkBuddy2API：%s", state_txt);
     if (sn.pid) head += WideFormat(L"（PID %lu）", sn.pid);
     lines.push_back(head);
-    lines.push_back(WideFormat(L"地址：http://127.0.0.1:%d", st.port));
+    {
+        std::wstring base = ServiceBaseUrl(st);
+        lines.push_back(base.empty() ? L"地址：(未配置服务地址)" : L"地址：" + base);
+    }
     if (StateIsOn(sn.state)) {
         std::wstring cnt = WideFormat(L"健康 %d/%d · 冷却 %d · 禁用 %d · 粘性会话 %d",
             sn.healthy, sn.total, sn.cooling, sn.disabled_n, sn.sticky);
@@ -899,6 +1079,13 @@ void Worker::BuildDisplayLocked()
         if (sn.in_flight_full > 0)
             cnt += WideFormat(L" · 在途满载 %d", sn.in_flight_full);
         lines.push_back(cnt);
+        // 域可服务性（wb2api ≥ v1.16.0 /healthz realm_servable）：只在某域不可服务
+        // 时占一行——双域都正常时信息量为零，tooltip 预算优先留给别的区块。
+        if (sn.realm_known && (!sn.cn_servable || !sn.global_servable)) {
+            lines.push_back(WideFormat(L"域可服务：cn %s · global %s",
+                sn.cn_servable ? L"可用" : L"不可用",
+                sn.global_servable ? L"可用" : L"不可用"));
+        }
         // 手动停用计数（上游 a20d06f）：服务端把 manual_disabled 也计入 disabled 总数，
         // 这里从 accounts 侧拆出"其中手动停用 N 个"，两种停用一眼可分。
         int manual = 0;
@@ -910,6 +1097,16 @@ void Worker::BuildDisplayLocked()
         if (sn.credit_floor > 0)
             lines.push_back(WideFormat(L"积分保底：%s（低于不接收费模型）",
                 FormatThousands(sn.credit_floor).c_str()));
+        // 成本探索（wb2api v1.19.x /status cost_explore）：解释"为什么最近总在
+        // 换号/某个模型被优先试"。只在真正发生过探索时占一行。
+        if (sn.explore_events > 0) {
+            std::wstring tail;
+            if (sn.explore_last_ts > 0 && !sn.explore_last_model.empty())
+                tail = WideFormat(L"（最近 %s @ %s）", sn.explore_last_model.c_str(),
+                    FormatTimeShort(sn.explore_last_ts).c_str());
+            lines.push_back(WideFormat(L"成本探索：累计 %lld 次%s",
+                (long long)sn.explore_events, tail.c_str()));
+        }
         // 模型锁池（wb2api ≥ v1.16.0 /status model_locks）：全池口径的模型可用性——
         // locked=全锁（换模型或等解锁才有用）、starved=全饿（账号级原因，等一下就好）、
         // partial=仍有号可服务（省略，单号视角已在账户明细的"模型限额"里）。
@@ -961,7 +1158,8 @@ void Worker::BuildDisplayLocked()
             std::wstring note;
             if (a.disabled && a.manual_disabled) note = L"禁用+停用";
             else if (a.manual_disabled) note = a.manual_reason.empty() ? L"已停用" : L"已停用(" + a.manual_reason + L")";
-            else if (a.disabled) note = L"已禁用";
+            else if (a.disabled) note = IsSessionRevokedReason(a.reason)
+                ? L"已禁用(会话失效,需重登)" : L"已禁用";
             else if (a.cooling) note = L"冷却中";
             else if (a.in_flight > 0) note = L"请求中";
             else note = L"正常";
@@ -1037,13 +1235,21 @@ void Worker::BuildDisplayLocked()
                     // 但任务已不执行，tooltip 不再为它占一行。
                     if (t.kind == "school") continue;
                     std::wstring mark = t.running ? L"执行中" : (t.enabled ? L"启用" : L"停用");
+                    // 活动补偿的"启用 + 空小时表"是合法态（只手动执行），与"启用但
+                    // 排程丢失"区分开，避免误以为任务坏了。
+                    if (!t.running && t.enabled && t.kind == "compensation" && t.next_fire.empty())
+                        mark = L"启用/仅手动";
                     std::wstring nxt = (t.running || !t.enabled || t.next_fire.empty())
                         ? L"" : WideFormat(L" 下次%s", t.next_fire.c_str());
                     lines.push_back(L"  " + t.label + L"[" + mark + nxt + L"]");
                 }
             }
         } else if (!sn.admin_available) {
-            lines.push_back(L"任务管理：需开启 wb2api 的 admin.enabled（README）");
+            // 403 与 404 排障方向完全不同：403 是 loopback 闸（Docker/远程直连），
+            // 404 是 admin 没开/版本旧。别让用户对着 Docker 部署去改 admin.enabled。
+            lines.push_back(sn.admin_forbidden
+                ? L"任务管理：服务端拒绝远程 /admin（仅 loopback；可 SSH 隧道映射到本机）"
+                : L"任务管理：需开启 wb2api 的 admin.enabled（README）");
         }
         if (sn.credits.have) {
             std::wstring usedtxt = sn.credits.total_used >= 0
@@ -1199,8 +1405,16 @@ bool Worker::RequestSetTaskHours(const std::string& kind, const std::vector<int>
     std::thread([this, kind, hours, key] {
         if (stop_.load()) { EndAct(key); return; } // 宿主卸载：不开工直接退场
         Settings s = SettingsStore::Instance().Get();
+        const bool docker = s.deploy_mode == DM_DOCKER;
         std::wstring note;
-        if (s.service_dir.empty()) {
+        if (BaseUrlMissing(s, note)) {
+            Update([&](Snapshot& sn) { NoteLocked(sn, note); });
+            EndAct(key);
+            return;
+        }
+        // Docker/远程模式不依赖本机服务目录：config.json 在容器里，插件只能走
+        // PATCH /admin/tasks 热改；直写文件路径在该模式下不可用。
+        if (!docker && s.service_dir.empty()) {
             note = L"未配置服务目录，无法写回 config.json";
         } else {
             // 首选 PATCH /admin/tasks {kind, hours}：服务端热生效（免重启、立即重排
@@ -1209,23 +1423,34 @@ bool Worker::RequestSetTaskHours(const std::string& kind, const std::vector<int>
             // pending_hours：先在快照里立起"已提交未生效"标记，再发请求——HTTP 往返
             // 最多 8 秒，期间设置窗可能已按旧快照回填；成功→更新为乐观值（快照追上
             // 前显示目标值），失败→立即清除（旧快照即真实值，不能吞掉 web 端的修改）。
-            std::string bearer = SettingsStore::Instance().CurrentApiKey();
+            std::string bearer = SettingsStore::Instance().CurrentApiKey(s);
+            // 空小时表用 "-" 作为 pending 文本："" 是"没有在途提交"的哨兵，空表
+            // 提交（活动补偿的"只手动"）必须能和它区分开。HoursMatchText 同样把
+            // "-" 解析成空表，快照追上即可了结。
+            const bool manual_only = hours.empty();
             std::wstring hvtxt;
             for (int hvv : hours) {
                 if (!hvtxt.empty()) hvtxt += L",";
                 hvtxt += std::to_wstring(hvv);
             }
+            if (manual_only) hvtxt = L"-";
             Update([&](Snapshot& sn) {
                 for (auto& t : sn.tasks)
                     if (t.kind == kind) t.pending_hours = hvtxt;
             });
-            std::wstring url = WideFormat(L"http://127.0.0.1:%d/admin/tasks", s.port);
+            std::wstring url = ServiceBaseUrl(s) + L"/admin/tasks";
             json body{ { "kind", kind }, { "hours", hours } };
             HttpResponse r = HttpJson(L"PATCH", url, bearer, body.dump(), 8000);
             if (stop_.load()) { EndAct(key); return; } // 取消后不碰快照/日志，尽快退场
             if (r.status == 200) {
-                note = WideFormat(L"%s 触发时间已热生效（%s 点），并写回 config.json",
-                    KindLabel(kind).c_str(), hvtxt.c_str());
+                // Docker 模式写的是服务端自己的 config.json，不是本机文件：
+                // 文案必须区分，否则用户会去本机目录找一个并未改动的文件。
+                const wchar_t* where = docker ? L"服务端配置" : L"config.json";
+                note = manual_only
+                    ? WideFormat(L"%s 已设为仅手动执行（清空自动排程），并写回%s",
+                        KindLabel(kind).c_str(), where)
+                    : WideFormat(L"%s 触发时间已热生效（%s 点），并写回%s",
+                        KindLabel(kind).c_str(), hvtxt.c_str(), where);
                 // 乐观回写 next_fire（不等下一轮 /admin/tasks，默认 60 秒），
                 // 但不动 hours / pending_hours：PATCH 200 前发出的旧轮询快照可能
                 // 晚于 200 到达，若提前清了 pending 标记，旧快照会把 hours 回冲成
@@ -1244,6 +1469,26 @@ bool Worker::RequestSetTaskHours(const std::string& kind, const std::vector<int>
                     for (auto& t : sn.tasks)
                         if (t.kind == kind) t.pending_hours.clear();
                 });
+            } else if (r.status == 403 && docker) {
+                // Docker/远程直连被 loopback 闸拒绝：本机也没有 config.json 可直写。
+                // 明确告诉用户走 SSH 隧道，而不是给一个注定的"写回失败"。
+                note = L"服务端拒绝远程 /admin（仅 loopback）：请用 SSH 隧道把容器端口映射到本机后，"
+                    L"将服务地址改为隧道地址";
+                Update([&](Snapshot& sn) {
+                    for (auto& t : sn.tasks)
+                        if (t.kind == kind) t.pending_hours.clear();
+                });
+            } else if (docker) {
+                // Docker 模式没有直写兜底：PATCH 失败即失败，保留 pending 只会让
+                // 输入框一直显示一个并未生效的值。
+                note = r.err.empty()
+                    ? WideFormat(L"%s：远程模式无法直写服务 config.json（HTTP %lu）",
+                        KindLabel(kind).c_str(), r.status)
+                    : KindLabel(kind) + L"：" + r.err;
+                Update([&](Snapshot& sn) {
+                    for (auto& t : sn.tasks)
+                        if (t.kind == kind) t.pending_hours.clear();
+                });
             } else {
                 // 其余状态码统一回退直写 config.json 的历史路径。旧版服务端两种表现：
                 // 404（loopback 闸外一律不存在感）或 400（decodeAdminJSON 拒未知字段
@@ -1255,8 +1500,11 @@ bool Worker::RequestSetTaskHours(const std::string& kind, const std::vector<int>
                 std::wstring err = SetTaskHours(cfg, kind + "_hours", hours);
                 if (stop_.load()) { EndAct(key); return; } // 直写含 .bak/.tmp/rename，卸载后同样不碰文件系统
                 if (err.empty()) {
-                    note = WideFormat(L"%s 触发时间已写回 config.json（%s 点），重启服务后生效",
-                        KindLabel(kind).c_str(), hvtxt.c_str());
+                    note = manual_only
+                        ? WideFormat(L"%s 已写回 config.json（留空=仅手动），重启服务后生效",
+                            KindLabel(kind).c_str())
+                        : WideFormat(L"%s 触发时间已写回 config.json（%s 点），重启服务后生效",
+                            KindLabel(kind).c_str(), hvtxt.c_str());
                 } else {
                     note = KindLabel(kind) + L"：" + err;
                     Update([&](Snapshot& sn) {
@@ -1291,6 +1539,12 @@ void Worker::ClearPendingHours(const std::string& kind)
 
 bool Worker::RequestStartService()
 {
+    // Docker/远程模式：本机没有 wb2api.exe，启停/自启全部不适用。给出明确提示
+    // 而不是静默失败（菜单命令无法置灰，只有回显能解释为什么没反应）。
+    if (SettingsStore::Instance().Get().deploy_mode == DM_DOCKER) {
+        Note(L"Docker/远程模式：插件不启动本地服务（请在容器宿主机 docker compose 操作）");
+        return false;
+    }
     if (!BeginAct("svc")) return false;
     std::thread([this] {
         if (stop_.load()) { EndAct("svc"); return; } // 宿主卸载：不开工直接退场
@@ -1314,6 +1568,10 @@ bool Worker::RequestStartService()
 
 bool Worker::RequestStopService()
 {
+    if (SettingsStore::Instance().Get().deploy_mode == DM_DOCKER) {
+        Note(L"Docker/远程模式：插件不停止容器服务（请在容器宿主机操作）");
+        return false;
+    }
     if (!BeginAct("svc")) return false;
     std::thread([this] {
         if (stop_.load()) { EndAct("svc"); return; }
@@ -1333,6 +1591,10 @@ bool Worker::RequestStopService()
 
 bool Worker::RequestRestartService()
 {
+    if (SettingsStore::Instance().Get().deploy_mode == DM_DOCKER) {
+        Note(L"Docker/远程模式：插件不重启容器服务（请在容器宿主机操作）");
+        return false;
+    }
     if (!BeginAct("svc")) return false;
     std::thread([this] {
         if (stop_.load()) { EndAct("svc"); return; }
@@ -1368,12 +1630,17 @@ bool Worker::RequestRunTask(const std::string& kind)
     std::thread([this, kind, key] {
         if (stop_.load()) { EndAct(key); return; }
         Settings s = SettingsStore::Instance().Get();
-        std::string bearer = SettingsStore::Instance().CurrentApiKey();
-        std::wstring url = WideFormat(L"http://127.0.0.1:%d/admin/tasks/run", s.port);
+        std::wstring note;
+        if (BaseUrlMissing(s, note)) {
+            Update([&](Snapshot& sn) { NoteLocked(sn, note); });
+            EndAct(key);
+            return;
+        }
+        std::string bearer = SettingsStore::Instance().CurrentApiKey(s);
+        std::wstring url = ServiceBaseUrl(s) + L"/admin/tasks/run";
         json body{ { "kind", kind } };
         HttpResponse r = HttpJson(L"POST", url, bearer, body.dump(), 8000);
         if (stop_.load()) { EndAct(key); return; }
-        std::wstring note;
         if (r.status == 202) {
             json j; try { j = json::parse(r.body); } catch (...) {}
             std::wstring names;
@@ -1390,6 +1657,8 @@ bool Worker::RequestRunTask(const std::string& kind)
             note = L"该类任务正在执行中，等它跑完再触发";
         } else if (r.status == 404) {
             note = L"/admin 未启用：升级 wb2api 并在 config.json 设 admin.enabled=true 后重启服务";
+        } else if (r.status == 403) {
+            note = L"服务端拒绝远程 /admin（仅 loopback）：Docker/远程请用 SSH 隧道映射到本机端口";
         } else if (r.status == 401) {
             note = L"api_key 不符（401），检查设置页或服务 config.json";
         } else {
@@ -1409,12 +1678,17 @@ bool Worker::RequestToggleTask(const std::string& kind, bool enabled)
     std::thread([this, kind, enabled, key] {
         if (stop_.load()) { EndAct(key); return; }
         Settings s = SettingsStore::Instance().Get();
-        std::string bearer = SettingsStore::Instance().CurrentApiKey();
-        std::wstring url = WideFormat(L"http://127.0.0.1:%d/admin/tasks", s.port);
+        std::wstring note;
+        if (BaseUrlMissing(s, note)) {
+            Update([&](Snapshot& sn) { NoteLocked(sn, note); });
+            EndAct(key);
+            return;
+        }
+        std::string bearer = SettingsStore::Instance().CurrentApiKey(s);
+        std::wstring url = ServiceBaseUrl(s) + L"/admin/tasks";
         json body{ { "kind", kind }, { "enabled", enabled } };
         HttpResponse r = HttpJson(L"PATCH", url, bearer, body.dump(), 4000);
         if (stop_.load()) { EndAct(key); return; }
-        std::wstring note;
         bool mark = enabled;
         if (r.status == 200) {
             json j; try { j = json::parse(r.body); } catch (...) {}
@@ -1424,6 +1698,7 @@ bool Worker::RequestToggleTask(const std::string& kind, bool enabled)
         } else {
             mark = !enabled; // 失败回滚本地勾选
             if (r.status == 404) note = L"/admin 未启用，无法改任务开关";
+            else if (r.status == 403) note = L"服务端拒绝远程 /admin（仅 loopback）：请用 SSH 隧道映射到本机";
             else if (r.status == 401) note = L"api_key 不符（401）";
             else note = r.err.empty() ? WideFormat(L"设置失败（HTTP %lu）", r.status) : r.err;
         }
@@ -1448,12 +1723,17 @@ bool Worker::RequestRefreshCredits()
     std::thread([this] {
         if (stop_.load()) { EndAct("credits"); return; }
         Settings s = SettingsStore::Instance().Get();
-        std::string bearer = SettingsStore::Instance().CurrentApiKey();
-        std::wstring url = WideFormat(L"http://127.0.0.1:%d/admin/credits", s.port);
+        std::wstring note;
+        if (BaseUrlMissing(s, note)) {
+            Update([&](Snapshot& sn) { NoteLocked(sn, note); });
+            EndAct("credits");
+            return;
+        }
+        std::string bearer = SettingsStore::Instance().CurrentApiKey(s);
+        std::wstring url = ServiceBaseUrl(s) + L"/admin/credits";
         // 每号一次上游查询（服务端已限速+冷却）；本地网络到 loopback，放宽到 120s 纯防卡死。
         HttpResponse r = HttpJson(L"POST", url, bearer, "{}", 120000);
         if (stop_.load()) { EndAct("credits"); return; }
-        std::wstring note;
         if (r.status == 200) {
             json j;
             bool parsed = true;
@@ -1480,6 +1760,8 @@ bool Worker::RequestRefreshCredits()
             if (cu > 0) Update([&](Snapshot& sn) { sn.credits.cooldown_until = cu; });
         } else if (r.status == 404) {
             note = L"/admin 未启用，无法查实时积分";
+        } else if (r.status == 403) {
+            note = L"服务端拒绝远程 /admin（仅 loopback）：请用 SSH 隧道映射到本机后重试";
         } else if (r.status == 401) {
             note = L"api_key 不符（401）";
         } else {
@@ -1505,15 +1787,20 @@ bool Worker::RequestAccountOp(const std::string& uid, const std::string& op)
     std::thread([this, uid, op, key] {
         if (stop_.load()) { EndAct(key); return; }
         Settings s = SettingsStore::Instance().Get();
-        std::string bearer = SettingsStore::Instance().CurrentApiKey();
-        std::wstring url = WideFormat(L"http://127.0.0.1:%d/admin/accounts/%s/%s",
-            s.port, Utf8ToWide(uid).c_str(), Utf8ToWide(op).c_str());
+        std::wstring note;
+        if (BaseUrlMissing(s, note)) {
+            Update([&](Snapshot& sn) { NoteLocked(sn, note); });
+            EndAct(key);
+            return;
+        }
+        std::string bearer = SettingsStore::Instance().CurrentApiKey(s);
+        std::wstring url = ServiceBaseUrl(s) + WideFormat(L"/admin/accounts/%s/%s",
+            Utf8ToWide(uid).c_str(), Utf8ToWide(op).c_str());
         // 空体即可（服务端 reason 可选）；4 秒：loopback 内存操作，纯防卡死。
         HttpResponse r = HttpJson(L"POST", url, bearer, "{}", 4000);
         if (stop_.load()) { EndAct(key); return; }
         const wchar_t* opzh = op == "disable" ? L"停用"
             : op == "enable" ? L"恢复" : L"复活";
-        std::wstring note;
         if (r.status == 200) {
             json j;
             bool parsed = true;
@@ -1553,6 +1840,8 @@ bool Worker::RequestAccountOp(const std::string& uid, const std::string& op)
             note = msg.empty()
                 ? L"/admin/accounts 不可用（admin 未启用或 wb2api 版本过旧）"
                 : L"操作失败：" + msg;
+        } else if (r.status == 403) {
+            note = L"服务端拒绝远程 /admin（仅 loopback）：请用 SSH 隧道映射到本机";
         } else if (r.status == 401) {
             note = L"api_key 不符（401）";
         } else {
@@ -1579,13 +1868,18 @@ bool Worker::RequestClearCooldown(const std::string& uid)
     std::thread([this, uid, key] {
         if (stop_.load()) { EndAct(key); return; }
         Settings s = SettingsStore::Instance().Get();
-        std::string bearer = SettingsStore::Instance().CurrentApiKey();
-        std::wstring url = WideFormat(L"http://127.0.0.1:%d/api/accounts/%s/clear-cooldown",
-            s.port, Utf8ToWide(uid).c_str());
+        std::wstring note;
+        if (BaseUrlMissing(s, note)) {
+            Update([&](Snapshot& sn) { NoteLocked(sn, note); });
+            EndAct(key);
+            return;
+        }
+        std::string bearer = SettingsStore::Instance().CurrentApiKey(s);
+        std::wstring url = ServiceBaseUrl(s) + WideFormat(L"/api/accounts/%s/clear-cooldown",
+            Utf8ToWide(uid).c_str());
         // 空体即可（服务端无入参）；4 秒：loopback 内存操作，纯防卡死。
         HttpResponse r = HttpJson(L"POST", url, bearer, "{}", 4000);
         if (stop_.load()) { EndAct(key); return; }
-        std::wstring note;
         if (r.status == 200) {
             // 非 JSON 的 200 响应（协议回归）不能落到"无可清状态"的误导提示：
             // 默认构造的 json 让 JBool 全取 false，与 RequestAccountOp 同样用
@@ -1613,6 +1907,8 @@ bool Worker::RequestClearCooldown(const std::string& uid)
             note = msg.empty()
                 ? L"清除冷却不可用（wb2api 需 ≥ v1.10.0，或面板未启用：panel.enabled）"
                 : L"清除冷却失败：" + Utf8ToWide(msg);
+        } else if (r.status == 403) {
+            note = L"服务端拒绝该请求（403）：检查安全策略/来源 IP 限制";
         } else if (r.status == 401) {
             note = L"api_key 不符（401）";
         } else {
@@ -1638,13 +1934,18 @@ void Worker::RequestSyncCreditsInterval(int minutes)
     std::thread([this, minutes, key] {
         if (stop_.load()) { EndAct(key); return; }
         Settings s = SettingsStore::Instance().Get();
-        std::string bearer = SettingsStore::Instance().CurrentApiKey();
-        std::wstring base = WideFormat(L"http://127.0.0.1:%d", s.port);
+        std::wstring note;
+        if (BaseUrlMissing(s, note)) {
+            Update([&](Snapshot& sn) { NoteLocked(sn, note); });
+            EndAct(key);
+            return;
+        }
+        std::string bearer = SettingsStore::Instance().CurrentApiKey(s);
+        std::wstring base = ServiceBaseUrl(s);
         json body{ { "interval_sec", minutes * 60 } };
         // 5 秒：loopback 小请求的宽裕上限
         HttpResponse r = HttpJson(L"PATCH", base + L"/admin/credits-interval", bearer, body.dump(), 5000);
         if (stop_.load()) { EndAct(key); return; }
-        std::wstring note;
         if (r.status == 200) {
             json j; try { j = json::parse(r.body); } catch (...) {}
             // 自愈：读回服务端实收值，分钟粒度取整的偏差（<1 分钟）直接接受
@@ -1662,6 +1963,8 @@ void Worker::RequestSyncCreditsInterval(int minutes)
             if (j.contains("error") && j["error"].is_object())
                 msg = Utf8ToWide(JStr(j["error"], "message"));
             note = msg.empty() ? L"服务端拒绝该间隔（400）" : msg;
+        } else if (r.status == 403) {
+            note = L"服务端拒绝远程 /admin（仅 loopback）：请用 SSH 隧道映射到本机";
         } else if (r.status == 401) {
             note = L"api_key 不符（401）";
         } else {

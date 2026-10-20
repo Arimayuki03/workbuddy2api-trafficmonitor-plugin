@@ -10,7 +10,13 @@
 #define IDC_EDT_DIR             1010
 #define IDC_BTN_BROWSE          1011
 #define IDC_EDT_PORT            1012
-// 1013/1014 曾是 API Key 输入框/提示：v1.1 删除（鉴权自动读服务 config.json）
+// 1013/1014 曾是 API Key 输入框/提示：v1.1 删除（鉴权自动读服务 config.json）；
+// v1.14.0 Docker/远程模式把 API Key 输入框重新加回来（容器配置不在本机）。
+#define IDC_CHK_DOCKER          1015
+#define IDC_EDT_URL             1016
+#define IDC_EDT_KEY             1017
+#define IDC_EDT_AUTHS           1018
+#define IDC_BTN_AUTHS           1019
 #define IDC_BTN_START           1020
 #define IDC_BTN_STOP            1021
 #define IDC_BTN_RESTART         1022
@@ -27,7 +33,7 @@
 
 // ③ 定时任务（每种任务的控件集合在代码里数组管理）
 #define IDC_TASK_BASE           1200  // i*10+0 chk, +2 下次, +3 状态, +5 按钮, +6 时间输入框, +7 应用按钮
-// 7 类任务（v1.8.0 起）→ i=0..6，占 1200..1277；IDC_BTN_RUNALL 不冲突
+// 8 类任务（v1.14.0 起含活动补偿）→ i=0..7，占 1200..1277；IDC_BTN_RUNALL 不冲突
 #define IDC_BTN_RUNALL          1291
 
 // ④ 显示

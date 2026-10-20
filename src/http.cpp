@@ -54,6 +54,12 @@ HttpResponse HttpJson(LPCWSTR method, const std::wstring& url,
     const std::string& bearer, const std::string& body_utf8, DWORD timeout_ms)
 {
     HttpResponse out;
+    // 传输边界再清洗一次 bearer：配置层已剔除控制字符，这里兜住其它调用方/
+    // 手写内存路径。CR/LF 拼进头会拆出额外头（注入），NUL 会让 WinHTTP 拒绝。
+    std::string safe_bearer;
+    safe_bearer.reserve(bearer.size());
+    for (char c : bearer)
+        if (c != '\r' && c != '\n' && c != '\0') safe_bearer.push_back(c);
     // URL 拆解
     URL_COMPONENTS uc{};
     uc.dwStructSize = sizeof uc;
@@ -91,12 +97,12 @@ HttpResponse HttpJson(LPCWSTR method, const std::wstring& url,
     }
 
     bool sent = false;
-    if (bearer.empty() && body_utf8.empty()) {
+    if (safe_bearer.empty() && body_utf8.empty()) {
         sent = WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
             WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
     } else {
         std::wstring headers;
-        if (!bearer.empty()) headers += L"Authorization: Bearer " + Utf8ToWide(bearer) + L"\r\n";
+        if (!safe_bearer.empty()) headers += L"Authorization: Bearer " + Utf8ToWide(safe_bearer) + L"\r\n";
         if (!body_utf8.empty()) headers += L"Content-Type: application/json; charset=utf-8\r\n";
         const void* body = body_utf8.empty() ? WINHTTP_NO_REQUEST_DATA : body_utf8.data();
         DWORD blen = static_cast<DWORD>(body_utf8.size());

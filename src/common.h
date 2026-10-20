@@ -44,6 +44,12 @@ std::wstring FormatTimeShort(int64_t unix_sec);
 // RFC3339 字符串（如 "2026-09-16T09:00:00+08:00"）→ 本地 HH:mm；失败返回原串。
 std::wstring FormatRfc3339Short(const std::string& rfc3339);
 
+// 账号禁用原因是否为「上游 401 网关鉴权页 / 会话被吊销」（wb2api v1.19.x 起
+// 服务端会把这类号自动禁用并写明 session revoked，需人工重登）。插件据此把
+// 通用"自动禁用"升级成"会话失效"提示；不依赖服务端原文逐字一致——两种服务端
+// 常量都认（SessionRevokedReason 与 401 gateway page 文案）。
+bool IsSessionRevokedReason(const std::wstring& reason);
+
 // 宽字符 snprintf 封装。
 std::wstring WideFormat(LPCWSTR fmt, ...);
 

@@ -1,6 +1,7 @@
 // http.h — WinHTTP 同步封装（只允许在 worker/action 线程调用，UI 线程禁止）。
-// 目标恒为本机 http://127.0.0.1:port —— 超时收紧、无 TLS、无连接复用（每次 30s 一级，
-// 会话重建开销可忽略，换来零跨线程句柄共享）。
+// 目标由设置决定：本地模式为本机 http://127.0.0.1:port，Docker/远程模式为
+// server_url（可 http/https）。超时收紧、无连接复用（每次 30s 一级，会话重建
+// 开销可忽略，换来零跨线程句柄共享）。
 #pragma once
 #include <string>
 #include <windows.h>

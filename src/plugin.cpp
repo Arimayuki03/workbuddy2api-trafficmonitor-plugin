@@ -43,10 +43,10 @@ const wchar_t* CPluginApp::GetInfo(PluginInfoIndex index)
     WB2API_TRACE_LOG("GetInfo");
     switch (index) {
     case TMI_NAME: return L"WorkBuddy2API";
-    case TMI_DESCRIPTION: return L"workbuddy2api 服务状态监控与手动控制（loopback 本地接口）";
+    case TMI_DESCRIPTION: return L"workbuddy2api 服务状态监控与手动控制（本地 / Docker·远程）";
     case TMI_AUTHOR: return L"Arima";
     case TMI_COPYRIGHT: return L"MIT License";
-    case TMI_VERSION: return L"1.13.0";
+    case TMI_VERSION: return L"1.14.0";
     case TMI_URL: return L"https://github.com/Arimayuki03/workbuddy2api-trafficmonitor-plugin";
     default: return L"";
     }
@@ -159,10 +159,11 @@ void CPluginApp::EnsureInited()
 namespace {
 
 // 开学季活动已随 wb2api v1.15.0 下架（到点只记"活动已结束"），菜单同步移除；
-// queue=任务队列、renew=令牌续期（wb2api v1.16.0 起 /admin/tasks 透出，
-// 各自 *_enabled 缺省 false）。
-const char* kKinds[7] = { "checkin", "travel", "activity", "keepalive", "cat", "queue", "renew" };
-const wchar_t* kKindZh[7] = { L"签到", L"旅行", L"活跃", L"保活", L"夜猫子", L"任务队列", L"令牌续期" };
+// queue=任务队列、renew=令牌续期（wb2api v1.16.0 起 /admin/tasks 透出）、
+// compensation=活动补偿（wb2api v1.19.2 起，小时表留空=只手动），三者
+// *_enabled 均缺省 false。
+const char* kKinds[8] = { "checkin", "travel", "activity", "keepalive", "cat", "queue", "renew", "compensation" };
+const wchar_t* kKindZh[8] = { L"签到", L"旅行", L"活跃", L"保活", L"夜猫子", L"任务队列", L"令牌续期", L"活动补偿" };
 const wchar_t* kSettingZh[3] = { L"开机自启(计划任务)", L"随TrafficMonitor启动", L"意外自动拉起" };
 
 // 命令分区基址全部由数组长度派生：加/删任务类命令时只需改 kKinds/kKindZh 数组，
@@ -170,21 +171,22 @@ const wchar_t* kSettingZh[3] = { L"开机自启(计划任务)", L"随TrafficMoni
 // 常量派生 + 编译期锁定让这类笔误过不了编译，而不是等运行时才发现勾选错位。
 constexpr int kCmdActionCount = 5;                                    // 0启动 1停止 2重启 3设置 4积分
 constexpr int kCmdRunBase = kCmdActionCount;                          // 5.. 立即执行
-constexpr int kCmdRunCount = (int)std::size(kKinds);                  // 7
-constexpr int kCmdEnableBase = kCmdRunBase + kCmdRunCount;            // 12.. 启用勾选
+constexpr int kCmdRunCount = (int)std::size(kKinds);                  // 8
+constexpr int kCmdEnableBase = kCmdRunBase + kCmdRunCount;            // 13.. 启用勾选
 constexpr int kCmdEnableCount = (int)std::size(kKinds);
-constexpr int kCmdSettingBase = kCmdEnableBase + kCmdEnableCount;     // 19.. 开关勾选
+constexpr int kCmdSettingBase = kCmdEnableBase + kCmdEnableCount;     // 21.. 开关勾选
 constexpr int kCmdSettingCount = (int)std::size(kSettingZh);          // 3
-constexpr int kCmdTotal = kCmdSettingBase + kCmdSettingCount;         // 22
-static_assert(kCmdTotal == 22, "命令总数与 kKinds/kSettingZh 布局不一致，请核对分区常量");
+constexpr int kCmdTotal = kCmdSettingBase + kCmdSettingCount;         // 24
+static_assert(kCmdTotal == 24, "命令总数与 kKinds/kSettingZh 布局不一致，请核对分区常量");
 
 // 开关命令 → kSettingZh 下标。基址取自 kCmdSettingBase，不再手写数字。
-int SettingIndex(int idx) { return idx - kCmdSettingBase; }  // 17..19 → 0..2
+int SettingIndex(int idx) { return idx - kCmdSettingBase; }  // 21..23 → 0..2（v1.14.0）
 
 } // namespace
 
-// 布局：0启动 1停止 2重启 3设置 4积分 | 5..11 立即执行(7类) | 12..18 启用勾选(7类) |
-// 19..21 开关勾选。v1.11.0 移除开学季命令后菜单 22→20 项；v1.16.0 增 renew 回到 22 项。
+// 布局：0启动 1停止 2重启 3设置 4积分 | 5..12 立即执行(8类) | 13..20 启用勾选(8类) |
+// 21..23 开关勾选。v1.11.0 移除开学季命令后菜单 22→20 项；v1.13.0 增 renew 回到 22；
+// v1.14.0 增 compensation 到 24 项。
 int CPluginApp::GetCommandCount() { WB2API_TRACE_LOG("GetCommandCount"); return kCmdTotal; }
 
 const wchar_t* CPluginApp::GetCommandName(int command_index)
@@ -215,9 +217,10 @@ int CPluginApp::IsCommandChecked(int command_index)
         std::string want = kKinds[command_index - kCmdEnableBase];
         for (auto& t : sn.tasks)
             if (t.kind == want) return t.enabled ? 1 : 0;
-        // queue/renew 服务端缺省 false，其余缺省启用：快照未回时按各自缺省显示
+        // queue/renew/compensation 服务端缺省 false，其余缺省启用：快照未回时
+        // 按各自缺省显示。
         std::string_view want_sv = kKinds[command_index - kCmdEnableBase];
-        return (want_sv == "queue" || want_sv == "renew") ? 0 : 1;
+        return (want_sv == "queue" || want_sv == "renew" || want_sv == "compensation") ? 0 : 1;
     }
     if (command_index >= kCmdSettingBase && command_index < kCmdSettingBase + kCmdSettingCount) {
         Settings s = SettingsStore::Instance().Get();
@@ -246,14 +249,21 @@ void CPluginApp::OnPluginCommand(int command_index, void* hWnd, void*)
         // 勾选切换：取反当前状态（服务端为准，动作失败会在快照刷新里回正）
         std::string want = kKinds[command_index - kCmdEnableBase];
         Snapshot sn = wk.Copy();
-        // queue/renew 服务端缺省关，其余缺省开
-        bool cur = (std::string_view(want) == "queue" || std::string_view(want) == "renew") ? false : true;
+        // queue/renew/compensation 服务端缺省关，其余缺省开
+        std::string_view want_sv(want);
+        bool cur = (want_sv == "queue" || want_sv == "renew" || want_sv == "compensation") ? false : true;
         for (auto& t : sn.tasks)
             if (t.kind == want) cur = t.enabled;
         wk.RequestToggleTask(want, !cur);
     }
     else if (command_index >= kCmdSettingBase && command_index < kCmdSettingBase + kCmdSettingCount) {
         int si = SettingIndex(command_index);
+        // Docker/远程模式本机没有服务进程：三个本地开关（计划任务/随 TM 拉起/
+        // 自动拉起）一律不写入，避免留下一个"勾着但永远不会生效"的状态。
+        if (SettingsStore::Instance().Get().deploy_mode == DM_DOCKER) {
+            wk.Note(L"Docker/远程模式：本地启停/自启开关不适用（请在容器宿主机操作）");
+            return;
+        }
         if (si == 0) {
             // 安装/卸载要走 schtasks（~百毫秒），放后台线程别卡菜单关闭
             Settings cur = SettingsStore::Instance().Get();

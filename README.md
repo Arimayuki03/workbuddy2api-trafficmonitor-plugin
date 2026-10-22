@@ -175,6 +175,8 @@
 
 该模式**不会启动/停止/重启本地服务**，也不读写本机 config.json；"开机自启/随 TM 拉起/意外拉起"三项自动失效。
 
+> **令牌剩余天数（可选）**：容器模式下"令牌剩"列不是从 `/status` 取的，而是插件读 `auths_dir` 下的 `workbuddy*.json`，取 `auth.expiresAt` 计算。`auths_dir` 必须是 **Windows 能直接访问的路径**：同机 Docker 填 bind mount 的宿主机源目录；跨机只能填 SMB/NFS 映射后的 UNC 或盘符。留空、目录不存在或无 `workbuddy*.json` 时该列显示 `-`（不会显示旧值）。扫描 5 分钟一轮，改完路径最多等 5 分钟或重启 TM。`auths` 文件含 refresh token，跨机共享请用只读、限制来源的共享，不要暴露到公网。
+
 > **安全提示**：插件会把 API Key 明文保存在 `WorkBuddy2ApiPlugin.json`（与 Service 目录下的 config.json 同性质）。该文件含管理密钥，请确认配置目录权限，不要放进公共同步盘或提交进仓库。跨主机的 `http://` 会明文传输 `Authorization: Bearer`，建议 `https://` 或 SSH 隧道；同机 loopback（`127.0.0.1`）不受此限。
 
 > **Docker 使用任务/实时积分的限制**：服务端 `/admin` 只接受 **loopback** 来源。Docker 的端口映射会让请求在容器内表现为网桥来源（不是 `127.0.0.1`），所以**即使 Docker 跑在同一台 Windows 上、插件填 `127.0.0.1:7863`，`/admin` 仍会 403**（`/healthz`、`/status` 不受影响；除非容器使用 host 网络）。插件会明确提示"远程被拒"。`/healthz`、`/status` 本身支持远程直连（带 API Key），不建隧道也能看状态、账户、积分估算、模型锁池和备注，只是任务页与实时积分按钮不可用。
@@ -293,7 +295,7 @@ powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1 -TMDir 'C:\Tools\Tra
 
 - 默认监控/控制 **本机回环**上的 wb2api；v1.14.0 起可切 **Docker/远程模式**对接任意地址（支持 `http://`/`https://`），但该模式**不启停本地服务进程**。
 - 服务端 `/admin` 仍只接受 **loopback** 来源：跨机直连时任务开关/立即执行/实时积分会被 403（插件明确提示"远程被拒"）。需要全功能时用 SSH 隧道，或让 TCP 代理与容器**共享网络命名空间**（`--network container:<name>`；host 网络部署则代理直接跑宿主机）；`/healthz`、`/status` 可远程直连（需正确 API Key）。
-- Docker/远程模式下，`auths` 目录是可选的宿主机映射路径；不填则账户表"令牌剩"列显示 `-`（插件无法读取容器内凭证文件）。
+- Docker/远程模式下，`auths` 目录是可选的宿主机映射路径；不填/不可读则账户表"令牌剩"列显示 `-`（插件无法读取容器内凭证文件，`/status` 也不下发到期时间）。WorkBuddy 网页面板同样不显示 token 到期日，只有"最近续期"；面板"导出账号"JSON 含 `auth.expiresAt`，但同时含 access/refresh token，查完请删除。
 - 账号"停用/恢复/复活"走服务端内存操作（幂等，重复点击不报错）；停用是独立状态位，对旧版服务端会提示不可用。
 - "模型用量"数据来自服务端 `GET /v1/stats` 的**进程内存聚合**：wb2api 重启即清零，插件只展示"本次运行累计"口径，无法回看历史；旧版服务端 tooltip 静默 30 分钟探测一次，其余时间跳过请求。"在途模型"台账同理是运行态（归零即删行、不落盘）。
 - 插件更新后「插件管理→重新加载」**不会**加载新代码（worker 线程钉住 DLL 映像，重载静默失效），改配置/换 DLL 后请**重启 TM**；部署脚本已做改名式替换，见"部署到 TrafficMonitor"一节。
@@ -314,6 +316,7 @@ powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1 -TMDir 'C:\Tools\Tra
 
 - **栏位不显示**：先查主窗口与任务栏窗口各自的「显示项目」是否勾选 `WB2API 服务状态`——插件加载正常 ≠ 已勾选显示（落盘在 TM 目录 config.ini 的 `plugin_display_item` 列表）。
 - **"定时任务/实时积分"页提示不可用**：服务端未开 `"admin": { "enabled": true }`，或用的是官方上游（无 `/admin` 接口）。
+- **容器模式"令牌剩"一直是 `-`**：插件只从 `auths_dir\workbuddy*.json` 的 `auth.expiresAt` 算剩余天数，不走 `/status`；容器内 `/app/auths` 默认在 Windows 上不可见。把 `auths_dir` 指向宿主机 bind mount 源目录（同机 Docker）或 SMB/NFS 映射路径（跨机），确认目录里有 `workbuddy*.json`；留空/路径不存在/无权限都会显示 `-`。WorkBuddy 网页面板也不显示 token 到期日，只有"最近续期"；面板"导出账号"的 JSON 含 `auth.expiresAt`，但同时含 access/refresh token，查完请删除。
 - **更新插件后行为没变**：「插件管理→重新加载」不生效，必须**重启 TrafficMonitor**（原因见上）。
 - **TM 弹"遇到不适当的参数。"**：多个信息型插件 tooltip 总长超 1024 字符，先关本插件的"账户明细"/其他插件的 tooltip 再试；详见[已知边界](#已知边界)。
 - **想看接口调用时序 / 排查宿主弹框**：设环境变量 `WB2API_TRACE=1` 后启动 TM，插件会记录接口调用时序，并把 first-chance 异常（C++ 异常含调用栈）写入追踪日志：默认 `<WB2API_TRACE_DIR>\wb2api_trace.log`（未设该变量则为 TM 当前目录），也可用 `WB2API_TRACE_PATH` 直接指定完整文件路径。普通 Release 产物即支持（运行期开关，无需专用构建），未开启时零开销。
